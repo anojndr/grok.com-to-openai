@@ -40,6 +40,10 @@ files (uploaded via Grok's presigned upload pipeline). Supported input types:
 - Chat Completions: `image_url`, `file` content parts
 - Responses API: `input_image`, `input_file` items
 
+If every attachment upload fails (e.g. anti-bot gating of grok.com REST), the
+request fails with an upstream error instead of silently sending the prompt
+without its files.
+
 ### Image Generation
 Prompts matching image-generation intent ("generate an image of...", "draw...")
 are routed to Grok's Imagine WebSocket (`wss://grok.com/ws/imagine/listen`).

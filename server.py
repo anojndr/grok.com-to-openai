@@ -268,8 +268,12 @@ TEXTUAL_EXT = re.compile(
 )
 
 
+_last_statsig_warn = 0.0
+
+
 async def refresh_statsig_pair() -> None:
-    async def fetch_page() -> str:
+    global _last_statsig_warn
+    async def fetch_page() -> str | None:
         from curl_cffi.requests import AsyncSession
         acc = pool.acquire()
         cookie = acc.cookie_header() if acc else ""
@@ -278,11 +282,21 @@ async def refresh_statsig_pair() -> None:
             r = await s.get(f"{GROK_BASE}/",
                             headers={"user-agent": USER_AGENT, "cookie": cookie},
                             timeout=30)
+            if r.status_code != 200:
+                # Cloudflare challenge pages carry no meta seed / curves;
+                # feeding them to the extractor silently keeps the pair
+                # unready. Return None so ensure_pair skips cleanly.
+                return None
             return r.text
     try:
         await statsig.ensure_pair(fetch_page)
     except Exception:
         pass
+    if not statsig.ready and time.time() - _last_statsig_warn > 600:
+        _last_statsig_warn = time.time()
+        logging.getLogger("uvicorn.error").warning(
+            "statsig pair unavailable (grok.com HTML blocked by anti-bot); "
+            "REST calls will go out without x-statsig-id")
 
 
 def content_to_text(content: Any) -> str:
@@ -439,6 +453,9 @@ async def stream_session_turn(sess: GrokSession, prompt: str, *,
     not found" on cross-account mentions), so upload with THIS session's
     account right before the turn."""
     if file_jobs:
+        upload_errors: list[str] = []
+        upload_succeeded = False
+        has_upload_jobs = any("file_id" not in j for j in file_jobs[:6])
         try:
             from curl_cffi.requests import AsyncSession as AS
             await refresh_statsig_pair()
@@ -447,17 +464,35 @@ async def stream_session_turn(sess: GrokSession, prompt: str, *,
                     if "file_id" in job:
                         attachment_ids = (attachment_ids or []) + [job["file_id"]]
                         continue
-                    fm = await upload_file(s, sess.cookie_header, statsig,
-                                           job.get("name") or "file",
-                                           job.get("data") or b"",
-                                           job.get("mime"))
+                    name = job.get("name") or "file"
+                    try:
+                        fm = await upload_file(s, sess.cookie_header, statsig,
+                                               name,
+                                               job.get("data") or b"",
+                                               job.get("mime"))
+                    except Exception as e:
+                        upload_errors.append(f"{name}: {e}")
+                        continue
                     fid = fm.get("fileMetadataId")
                     if fid:
                         attachment_ids = (attachment_ids or []) + [fid]
+                        upload_succeeded = True
+                    else:
+                        upload_errors.append(f"{name}: upload returned no fileMetadataId")
         except Exception as e:
+            upload_errors.append(str(e))
+        if upload_errors and has_upload_jobs and not upload_succeeded:
+            # Never ship a prompt whose attachments were all dropped: grok
+            # then confidently answers "you didn't attach anything" (the
+            # 2026-08-25 "fact check this" incident). Pre-existing
+            # attachment ids do not rescue a fully-failed batch - those new
+            # files are simply gone. Fail the turn so the caller fails over
+            # to another account or errors out honestly.
+            raise GatewayError(
+                "upstream", "attachment upload failed: " + "; ".join(upload_errors[:3]))
+        if upload_errors:
             logging.getLogger("uvicorn.error").warning(
-                "attachment upload failed: %s", e)
-            attachment_ids = None
+                "some attachments failed to upload: %s", "; ".join(upload_errors[:3]))
     async for ev in sess.ask(prompt, attachment_ids=attachment_ids,
                              system_prompt=system_prompt, user_text=prompt):
         yield ev
@@ -1441,38 +1476,49 @@ async def responses_api(request: Request):
         turn_acc = None
         turn_state = None
 
+        # Turn failure after the initial frames are flushed must terminate the
+        # SSE stream with a structured response.failed event; raising
+        # HTTPException here aborts the connection mid-stream instead.
+        turn_error: Exception | None = None
+
+        def _fail_turn(err: Exception) -> None:
+            nonlocal turn_error
+            turn_error = err
+
         import unittest.mock
         if sess_prev is not None:
             acc = pool.acquire_by_key(sess_prev.account_key)
             if not acc:
-                raise HTTPException(409, "previous response account is cooling down; retry")
-            st = sess_prev
-            st.touch()
-            turn_acc = acc
-            turn_state = st
-            try:
-                async for ev in stream_session_turn(
-                        st.grok, prompt, file_jobs=remaining_jobs or None,
-                        system_prompt=instructions):
-                    ev_type = ev.get("type")
-                    if ev_type == "text_delta":
-                        raw_delta = ev.get("text", "")
-                        clean_delta = render_filter.process(raw_delta)
-                        if clean_delta:
-                            accumulated_text.append(clean_delta)
-                            yield evt("response.output_text.delta", {
-                                "type": "response.output_text.delta", "item_id": msg_id,
-                                "output_index": 0, "content_index": 0, "delta": clean_delta})
-                    elif ev_type == "done":
-                        final_turn_result = ev.get("result")
-                pool.release_ok(acc)
-            except GatewayError as e:
-                pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
-                await st.grok.close()
-                async with SESSION_LOCK:
-                    if prev_resp_id:
-                        SESSIONS.pop(prev_resp_id, None)
-                raise HTTPException(429 if e.kind == "quota" else 502, f"grok error ({e.kind}): {e}")
+                _fail_turn(HTTPException(409, "previous response account is cooling down; retry"))
+                acc = None
+            if acc is not None:
+                st = sess_prev
+                st.touch()
+                turn_acc = acc
+                turn_state = st
+                try:
+                    async for ev in stream_session_turn(
+                            st.grok, prompt, file_jobs=remaining_jobs or None,
+                            system_prompt=instructions):
+                        ev_type = ev.get("type")
+                        if ev_type == "text_delta":
+                            raw_delta = ev.get("text", "")
+                            clean_delta = render_filter.process(raw_delta)
+                            if clean_delta:
+                                accumulated_text.append(clean_delta)
+                                yield evt("response.output_text.delta", {
+                                    "type": "response.output_text.delta", "item_id": msg_id,
+                                    "output_index": 0, "content_index": 0, "delta": clean_delta})
+                        elif ev_type == "done":
+                            final_turn_result = ev.get("result")
+                    pool.release_ok(acc)
+                except GatewayError as e:
+                    pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
+                    await st.grok.close()
+                    async with SESSION_LOCK:
+                        if prev_resp_id:
+                            SESSIONS.pop(prev_resp_id, None)
+                    _fail_turn(e)
         elif isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
             mock_res = await pick_account_and_turn(
                 prefix_key, users[:], mode=mode, prompt=prompt,
@@ -1486,22 +1532,39 @@ async def responses_api(request: Request):
                     "type": "response.output_text.delta", "item_id": msg_id,
                     "output_index": 0, "content_index": 0, "delta": filtered_mock})
         else:
-            async for ev in pick_account_and_stream_turn(
-                    prefix_key, users[:], mode=mode, prompt=prompt,
-                    file_jobs=remaining_jobs or None, system_prompt=instructions):
-                turn_acc = ev.get("acc")
-                turn_state = ev.get("state")
-                ev_type = ev.get("type")
-                if ev_type == "text_delta":
-                    raw_delta = ev.get("text", "")
-                    clean_delta = render_filter.process(raw_delta)
-                    if clean_delta:
-                        accumulated_text.append(clean_delta)
-                        yield evt("response.output_text.delta", {
-                            "type": "response.output_text.delta", "item_id": msg_id,
-                            "output_index": 0, "content_index": 0, "delta": clean_delta})
-                elif ev_type == "done":
-                    final_turn_result = ev.get("result")
+            try:
+                async for ev in pick_account_and_stream_turn(
+                        prefix_key, users[:], mode=mode, prompt=prompt,
+                        file_jobs=remaining_jobs or None, system_prompt=instructions):
+                    turn_acc = ev.get("acc")
+                    turn_state = ev.get("state")
+                    ev_type = ev.get("type")
+                    if ev_type == "text_delta":
+                        raw_delta = ev.get("text", "")
+                        clean_delta = render_filter.process(raw_delta)
+                        if clean_delta:
+                            accumulated_text.append(clean_delta)
+                            yield evt("response.output_text.delta", {
+                                "type": "response.output_text.delta", "item_id": msg_id,
+                                "output_index": 0, "content_index": 0, "delta": clean_delta})
+                    elif ev_type == "done":
+                        final_turn_result = ev.get("result")
+            except (GatewayError, HTTPException) as e:
+                _fail_turn(e)
+
+        if turn_error is not None:
+            status = getattr(turn_error, "status_code", None) or (
+                429 if getattr(turn_error, "kind", "") == "quota" else 502)
+            detail = getattr(turn_error, "detail", None) or str(turn_error)
+            failed_response = dict(resp_in_prog)
+            failed_response.update({
+                "status": "failed",
+                "completed_at": now_epoch(),
+                "error": {"code": f"http_{status}", "message": detail},
+            })
+            yield evt("response.failed",
+                      {"type": "response.failed", "response": failed_response})
+            return
 
         flushed = render_filter.flush()
         if flushed:

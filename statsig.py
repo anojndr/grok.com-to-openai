@@ -284,6 +284,8 @@ class StatsigGenerator:
                 return self._seed_b64, self._hex
             try:
                 html = await fetch_page()
+                if not html:
+                    return self._seed_b64, self._hex
                 seed_b64 = extract_meta_seed(html)
                 curves = extract_curves(html)
                 if seed_b64 and curves:

@@ -28,10 +28,27 @@ def guess_mime(filename: str, provided: str | None = None) -> str:
     return guessed or "application/octet-stream"
 
 
+def _sig_headers(statsig: StatsigGenerator | None, path: str, method: str) -> dict[str, str]:
+    """x-statsig-id header when the generator holds a seed/hex pair; {} otherwise.
+
+    The pair bootstraps from grok.com HTML, which Cloudflare may block; when it
+    is unavailable the request must still go out (the pre-statsig upload flow
+    worked without this header) instead of raising and dropping attachments.
+    """
+    if statsig is not None and statsig.ready:
+        try:
+            return {"x-statsig-id": statsig.generate(path, method)}
+        except Exception:
+            # Corrupt seed/hex (e.g. bad cached state) must not fail the
+            # upload; proceed without the optional header instead.
+            return {}
+    return {}
+
+
 async def upload_file(
     session: AsyncSession,
     acc_cookie: str,
-    statsig: StatsigGenerator,
+    statsig: StatsigGenerator | None,
     filename: str,
     data: bytes,
     mime: str | None = None,
@@ -44,7 +61,7 @@ async def upload_file(
         "origin": GROK_BASE,
         "referer": f"{GROK_BASE}/",
         "cookie": acc_cookie,
-        "x-statsig-id": statsig.generate("/rest/app-chat/upload-file-v2/init", "POST"),
+        **_sig_headers(statsig, "/rest/app-chat/upload-file-v2/init", "POST"),
     }
     r = await session.post(
         f"{GROK_BASE}/rest/app-chat/upload-file-v2/init",
@@ -75,7 +92,7 @@ async def upload_file(
     comp_headers = {
         **headers_base,
         "content-type": "application/json",
-        "x-statsig-id": statsig.generate("/rest/app-chat/upload-file-v2/complete", "POST"),
+        **_sig_headers(statsig, "/rest/app-chat/upload-file-v2/complete", "POST"),
     }
     cr = await session.post(
         f"{GROK_BASE}/rest/app-chat/upload-file-v2/complete",
@@ -92,7 +109,7 @@ async def upload_file(
     for _ in range(20):
         st_headers = {
             **headers_base,
-            "x-statsig-id": statsig.generate("/rest/app-chat/upload-file-v2/status", "GET"),
+            **_sig_headers(statsig, "/rest/app-chat/upload-file-v2/status", "GET"),
         }
         sr = await session.get(
             f"{GROK_BASE}/rest/app-chat/upload-file-v2/status",
