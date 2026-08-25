@@ -1,0 +1,455 @@
+"""Grok WebSocket Gateway client (wss://grok.com/ws/mgw/).
+
+A GrokSession wraps one live gateway connection = one grok conversation.
+Sequential ask() calls on the same session are proper multi-turn: grok keeps
+the full context server-side, only the new user message travels the wire.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import AsyncIterator
+from typing import Any
+
+import websockets
+
+from config import GROK_BASE, USER_AGENT
+
+ASSET_BASE = "https://assets.grok.com/"
+
+RENDER_TAG_RE = re.compile(r"<grok:render\b.*?(?:</grok:render>|$)", re.S)
+URL_OR_PATH_RE = re.compile(
+    r'(?:https?://assets\.grok\.com/users/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp|gif)|users/[0-9a-fA-F-]+/(?:generated|attachments)/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp|gif))',
+    re.I,
+)
+
+
+def strip_render_tags(text: str) -> str:
+    """Remove grok:render pseudo-HTML card markup from streamed text."""
+    return RENDER_TAG_RE.sub("", text)
+
+
+def _asset_url(u: str) -> str:
+    if u.startswith(("data:", "http://", "https://")):
+        return u
+    return ASSET_BASE + u.lstrip("/")
+
+
+def chunk_image_url(value: Any) -> str | None:
+    """Extract a finished image URL/data-URI from a gateway chunk payload.
+
+    Image generation/editing arrives as card chunks — render_edited_image /
+    render_generated_image with an inner image_chunk ({imageUrl, progress};
+    progress 50 carries a data: URI placeholder, 100 the final asset path),
+    plus legacy flat shapes ({imageUrl|url|image_url}). Returns None for
+    in-progress placeholders and non-image payloads.
+    """
+    if not isinstance(value, dict):
+        return None
+    ic = value.get("image_chunk")
+    if isinstance(ic, dict):
+        u = ic.get("imageUrl") or ic.get("image_url") or ""
+        prog = ic.get("progress")
+        if u and (prog is None or prog >= 100):
+            return _asset_url(u)
+        return None
+    u = value.get("imageUrl") or value.get("url") or value.get("image_url")
+    if isinstance(u, str) and u:
+        return _asset_url(u)
+    # Card payloads sometimes carry the asset path in an unexpected field;
+    # scan the values for a Grok asset path before giving up.
+    for v in value.values():
+        if isinstance(v, str) and ("assets.grok.com/users/" in v or v.startswith("users/")):
+            m = URL_OR_PATH_RE.search(v)
+            if m:
+                return _asset_url(m.group(0))
+    return None
+
+
+def _card_query(card: Any) -> str | None:
+    """Extract the search query from a tool_usage_card payload.
+
+    Live mgw frames carry it on response.chunk as
+    tool_usage_card.web_search.args.query; tolerate the flat .query variant
+    and the response.grok.output placement seen on other gateway builds.
+    """
+    if not isinstance(card, dict):
+        return None
+    wq = card.get("web_search")
+    if not isinstance(wq, dict):
+        return None
+    args = wq.get("args")
+    q = args.get("query") if isinstance(args, dict) else None
+    if not isinstance(q, str):
+        q = wq.get("query")
+    return q.strip() if isinstance(q, str) and q.strip() else None
+
+
+def extract_web_results(event: dict) -> list[dict]:
+    """Normalize citation entries ({url, title}) out of a gateway event.
+
+    Multiple event shapes carry grok's web citations:
+      response.chunk        -> chunk.tool_result.web_search.webpages[]
+      response.chunk        -> chunk.tool_result.web_search_results[] / web_results[]
+      response.grok.output  -> output.tool_result.web_search.webpages[]
+      response.grok.output  -> output.card_attachment {url, title}
+      response.search.result -> result.web_results[] / result.webSearch_results[]
+    """
+    if not isinstance(event, dict):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add_entry(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        url = str(item.get("url") or "").strip()
+        if not url:
+            return
+        key = url.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        title = str(item.get("title") or "").strip() or url
+        out.append({"url": url, "title": title})
+
+    def scan_obj(obj: Any) -> None:
+        if not isinstance(obj, dict):
+            return
+        # check direct card_attachment
+        card_att = obj.get("card_attachment")
+        if isinstance(card_att, dict):
+            add_entry(card_att)
+
+        # check result payload
+        result = obj.get("result")
+        if isinstance(result, dict):
+            for k in ("web_results", "webSearch_results", "webpages", "results"):
+                items = result.get(k)
+                if isinstance(items, list):
+                    for item in items:
+                        add_entry(item)
+
+        # check tool_result payload
+        tool = obj.get("tool_result")
+        if isinstance(tool, dict):
+            ws = tool.get("web_search")
+            if isinstance(ws, dict):
+                for k in ("webpages", "results", "web_results"):
+                    items = ws.get(k)
+                    if isinstance(items, list):
+                        for item in items:
+                            add_entry(item)
+            for k in ("web_search_results", "web_results", "webpages", "results"):
+                items = tool.get(k)
+                if isinstance(items, list):
+                    for item in items:
+                        add_entry(item)
+
+    sub = event.get("event") if isinstance(event.get("event"), dict) else {}
+    for container in (event, sub):
+        if not isinstance(container, dict):
+            continue
+        scan_obj(container)
+        scan_obj(container.get("output"))
+        scan_obj(container.get("chunk"))
+
+    return out
+
+
+class GatewayError(Exception):
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+# ---------------------------------------------------------------------------
+# Degraded-turn detection
+# ---------------------------------------------------------------------------
+# Some accounts' gateways intermittently run their web-search tool against
+# placeholder queries unrelated to the user's message (observed live:
+# "current information and recent sources", "best expert recommendations
+# and evidence", "latest updates and authoritative references"), then the
+# model summarizes that unrelated content into fluent-looking word salad
+# that still parses as a successful 200. The turn is detectable before the
+# salad streams: tool_usage_card.web_search.query arrives on
+# response.grok.output ahead of the text deltas. A genuine search almost
+# always echoes at least one significant token of the user's message, so a
+# query sharing zero tokens is the signature of the degraded path.
+
+USER_TOKEN_RE = re.compile(r"[a-z0-9]{4,}")
+# Observed placeholder queries from degraded gateways; a single match here
+# is enough to fail the turn even when only one search has run.
+GENERIC_SEARCH_QUERIES = frozenset({
+    "current information and recent sources",
+    "best expert recommendations and evidence",
+    "latest updates and authoritative references",
+})
+
+
+STOPWORD_TOKENS = frozenset({
+    "the", "and", "for", "are", "but", "not", "you", "all", "any", "can",
+    "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
+    "how", "man", "new", "now", "old", "see", "two", "way", "who", "its",
+    "did", "that", "she", "they", "with", "what", "when", "where", "which",
+    "this", "from", "have", "will", "your", "into",
+})
+
+
+def unrelated_queries(queries: list[str], user_text: str) -> bool:
+    """True when 2+ tool queries share no token with the user text, or any query is a known placeholder.
+
+    A known placeholder query aborts immediately on its own, even if the prompt is short or empty.
+    When user_text has tokens, 2 or more unrelated queries (whether distinct or duplicated)
+    signal degraded behavior. Duplicated identical queries count once toward that threshold;
+    a single unrelated query is tolerated as legitimate paraphrase.
+    """
+    if not queries:
+        return False
+    cleaned = [q.lower().strip() for q in queries if q and q.lower().strip()]
+    if any(q in GENERIC_SEARCH_QUERIES for q in cleaned):
+        return True
+    if not user_text:
+        return False
+    raw_tokens = re.findall(r"[a-z0-9]{3,}|[^\x00-\x7f]+", user_text.lower())
+    tokens = {t for t in raw_tokens if t not in STOPWORD_TOKENS}
+    if not tokens:
+        return False
+    unrelated = [q for q in cleaned if not any(t in q for t in tokens)]
+    # 2+ unrelated queries signal degraded behavior; repeated identical unrelated queries
+    # also count (the gateway is stuck searching the same off-topic content).
+    distinct_unrelated = {q for q in unrelated}
+    if len(distinct_unrelated) >= 2:
+        return True
+    return len(unrelated) >= 2
+
+
+@dataclass
+class TurnResult:
+    text: str = ""
+    reasoning: str = ""
+    image_urls: list[str] = field(default_factory=list)
+    sources: list[dict] = field(default_factory=list)
+    search_queries: list[str] = field(default_factory=list)
+    response_id: str = ""
+    conversation_id: str = ""
+    parent_response_id: str = ""
+    finish_reason: str = "stop"
+
+
+def new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def default_x_grok() -> dict:
+    return {
+        "protocol_capabilities": ["conversation_attached", "custom_methods_v1"],
+        "use_chunk": True, "enable_side_by_side": True,
+        "force_side_by_side": False, "enable_image_generation": True,
+        "image_generation_count": 2, "disable_text_follow_ups": False,
+        "disable_artifact": True, "force_concise": False,
+        "keep_context": False, "is_temporary": True, "disable_memory": True,
+    }
+
+
+async def resolve_user_id(cookie_header: str) -> str:
+    from curl_cffi.requests import AsyncSession
+    async with AsyncSession(impersonate="chrome") as s:
+        r = await s.get(f"{GROK_BASE}/api/auth/session",
+                        headers={"user-agent": USER_AGENT, "cookie": cookie_header}, timeout=20)
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                uid = (data.get("user") or {}).get("id") or (data.get("session") or {}).get("userId") or data.get("userId") or ""
+                if uid: return uid
+            except Exception: pass
+        raise GatewayError("auth", f"failed to resolve user id ({r.status_code})")
+
+
+class GrokSession:
+    def __init__(self, cookie_header: str, user_id: str, model_mode: str = "fast"):
+        self.cookie_header, self.user_id, self.model_mode = cookie_header, user_id, model_mode
+        self.ws = None
+        self.conversation_id = ""
+        self.last_parent_response_id = ""
+        self.lock = asyncio.Lock()
+
+    async def connect(self) -> None:
+        uri = f"wss://grok.com/ws/mgw/?uid={self.user_id}"
+        headers = {"Origin": GROK_BASE, "User-Agent": USER_AGENT,
+                   "Accept-Language": "en-US,en;q=0.9", "Cookie": self.cookie_header}
+        try:
+            self.ws = await websockets.connect(uri, additional_headers=headers,
+                                               max_size=32 * 1024 * 1024,
+                                               open_timeout=30, close_timeout=10)
+            await self.ws.send(json.dumps({"event": {"type": "session.create",
+                "event_id": "evt_init_" + new_uuid(),
+                "session": {"model": self.model_mode, "x_grok": default_x_grok()}}}))
+            while not self.conversation_id:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=30)
+                try:
+                    env = json.loads(raw)
+                except Exception as e:
+                    raise GatewayError("upstream", f"malformed json in handshake: {e}")
+                ev = env.get("event") or {}
+                if ev.get("type") == "session.created":
+                    self.conversation_id = env.get("session_id") or ""
+                elif ev.get("type") == "error":
+                    raise GatewayError("upstream", json.dumps(ev.get("error"))[:200])
+        except Exception:
+            await self.close()
+            raise
+
+    async def close(self) -> None:
+        if self.ws:
+            try: await self.ws.close()
+            except Exception: pass
+            self.ws = None
+
+    def alive(self) -> bool:
+        if self.ws is None: return False
+        try:
+            from websockets.protocol import State
+            return self.ws.protocol.state is State.OPEN
+        except Exception: return False
+
+    async def ask(self, prompt: str, *, attachment_ids=None, system_prompt=None,
+                  user_text: str = "", idle_timeout: float = 120.0,
+                  max_turn_timeout: float = 300.0) -> AsyncIterator[dict]:
+        async with self.lock:
+            completed_turn = False
+            try:
+                if not self.alive(): await self.connect()
+                chunks = []
+                if system_prompt: chunks.append({"text": {"text": system_prompt + "\n\n"}})
+                if attachment_ids:
+                    for aid in attachment_ids:
+                        chunks.append({"mention": {"file_mention": {"file_id": aid}}})
+                chunks.append({"text": {"text": prompt}})
+                now_ms = int(time.time() * 1000)
+                item = {"type": "message", "role": "user",
+                        "x_grok": {"client_message_id": new_uuid(), "input_chunks": chunks}}
+                item_ev = {"session_id": self.conversation_id,
+                           "event": {"type": "conversation.item.create",
+                                     "event_id": f"evt_msg_{now_ms}_{new_uuid()[:8]}", "item": item}}
+                if self.last_parent_response_id:
+                    item_ev["event"]["parent_response_id"] = self.last_parent_response_id
+                await self.ws.send(json.dumps(item_ev))
+                await self.ws.send(json.dumps({"session_id": self.conversation_id,
+                    "event": {"type": "response.create", "event_id": f"evt_resp_{now_ms}_{new_uuid()[:8]}"}}))
+
+                text, reasoning, images = [], [], []
+                tool_queries: list[str] = []   # web_search queries seen this turn
+                sources: list[dict] = []
+                seen_source_urls: set[str] = set()
+                response_id, user_msg_id = "", ""
+                turn_start = time.time()
+                last = turn_start
+                while True:
+                    if time.time() - turn_start > max_turn_timeout:
+                        raise GatewayError("timeout", "gateway turn exceeded max duration")
+                    try:
+                        raw = await asyncio.wait_for(self.ws.recv(), timeout=max(1.0, idle_timeout-(time.time()-last)))
+                        last = time.time()
+                    except asyncio.TimeoutError: raise GatewayError("timeout", "gateway idle timeout")
+                    except websockets.ConnectionClosed: raise GatewayError("closed", "connection closed mid-turn")
+                    try: env = json.loads(raw)
+                    except Exception: continue
+                    ev = env.get("event") or {}; et = ev.get("type", "")
+                    if et == "error":
+                        err = ev.get("error") or {}
+                        raise GatewayError("upstream", err.get("message") or json.dumps(err)[:200])
+                    elif et == "response.search.result":
+                        for src in extract_web_results(env):
+                            k = src["url"].lower()
+                            if k not in seen_source_urls:
+                                seen_source_urls.add(k)
+                                sources.append(src)
+                    elif et == "response.grok.output":
+                        out = ev.get("output") or {}; serr = out.get("stream_error")
+                        if serr:
+                            kind = serr.get("kind", "")
+                            raise GatewayError("quota" if "usage_limit" in kind else "upstream",
+                                               serr.get("message", "stream error"))
+                        query = _card_query(out.get("tool_usage_card"))
+                        if query:
+                            tool_queries.append(query)
+                            if unrelated_queries(tool_queries, user_text):
+                                raise GatewayError(
+                                    "degraded",
+                                    "gateway searched content unrelated to the "
+                                    "request (degraded account)")
+                        for src in extract_web_results(env):
+                            k = src["url"].lower()
+                            if k not in seen_source_urls:
+                                seen_source_urls.add(k)
+                                sources.append(src)
+                        for obj in (out.get("generated_image"), out.get("image")):
+                            u = chunk_image_url(obj)
+                            if u and u not in images:
+                                images.append(u); yield {"type": "image_url", "url": u}
+                    elif et == "response.chunk":
+                        chunk = ev.get("chunk") or {}
+                        query = _card_query(chunk.get("tool_usage_card"))
+                        if query:
+                            tool_queries.append(query)
+                            if unrelated_queries(tool_queries, user_text):
+                                raise GatewayError(
+                                    "degraded",
+                                    "gateway searched content unrelated to the "
+                                    "request (degraded account)")
+                        for src in extract_web_results(env):
+                            k = src["url"].lower()
+                            if k not in seen_source_urls:
+                                seen_source_urls.add(k)
+                                sources.append(src)
+                        tinfo = chunk.get("text") or {}; val = tinfo.get("text", "")
+                        channel = tinfo.get("channel", "")
+                        for key in ("render_edited_image", "render_generated_image",
+                                    "imageChunk", "image_attachment", "imageAttachment",
+                                    "image", "generatedImage", "media"):
+                            u = chunk_image_url(chunk.get(key))
+                            if u and u not in images:
+                                images.append(u); yield {"type": "image_url", "url": u}
+                        if val:
+                            if "NOTETAKER" in channel:
+                                reasoning.append(val); yield {"type": "reasoning_delta", "text": val}
+                            else:
+                                text.append(val); yield {"type": "text_delta", "text": val}
+                    elif et == "response.output_text.delta":
+                        d = ev.get("delta")
+                        if d: text.append(d); yield {"type": "text_delta", "text": d}
+                    elif et == "response.reasoning_text.delta":
+                        d = ev.get("delta", "")
+                        if d: reasoning.append(d); yield {"type": "reasoning_delta", "text": d}
+                    elif et == "conversation.item.added":
+                        it = ev.get("item") or {}
+                        if it.get("role") == "user": user_msg_id = it.get("id") or user_msg_id
+                    elif et == "response.output_item.added":
+                        it = ev.get("item") or {}
+                        if it.get("role") == "assistant": response_id = it.get("id") or response_id
+                    elif et == "response.done":
+                        resp = ev.get("response") or {}; status = resp.get("status", "completed")
+                        raw_text = "".join(text)
+                        for match in URL_OR_PATH_RE.findall(raw_text):
+                            img_u = _asset_url(match)
+                            if img_u not in images:
+                                images.append(img_u)
+                        result = TurnResult(text=strip_render_tags(raw_text), reasoning="".join(reasoning),
+                            image_urls=images, response_id=response_id or resp.get("id", ""),
+                            sources=sources, search_queries=list(tool_queries),
+                            conversation_id=self.conversation_id, parent_response_id=user_msg_id,
+                            finish_reason="stop" if status == "completed" else "length")
+                        self.last_parent_response_id = result.response_id
+                        completed_turn = True
+                        yield {"type": "done", "result": result, "usage": resp.get("usage") or {}}
+                        return
+            finally:
+                if not completed_turn:
+                    # If aborted/cancelled mid-turn, close the WebSocket so stale unread frames
+                    # don't corrupt subsequent turns on this session.
+                    await self.close()
+                    self.last_parent_response_id = ""

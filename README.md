@@ -1,103 +1,165 @@
-# grok-to-openai
+# grok-to-openai-api
 
-OpenAI-compatible API proxy for [grok.com](https://grok.com). It fronts grok's WebSocket chat gateway with a FastAPI server that speaks the OpenAI API, so existing OpenAI clients and tools can talk to Grok unchanged.
+Turn [grok.com](https://grok.com/) free accounts into an OpenAI-compatible API using FastAPI.
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env  # edit: set PIXELVAULT_API_KEY and optionally G2O_API_KEY
+python3 server.py     # serves on port 45080
+```
+
+## Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | Chat Completions API (stream + non-stream) |
+| `POST /v1/responses` | Responses API (stream + non-stream, `previous_response_id` chaining) |
+| `GET /v1/models` | List available models |
+| `GET /healthz` | Server health + account pool status |
+
+## Models
+
+- `grok-fast` — Grok 4.5 Fast (default)
+- `grok-auto` — Auto mode
+- `grok-expert` — Grok 4.5 Expert/Thinking
+- `grok-heavy` — Grok 4.5 Heavy (requires paid tier)
 
 ## Features
 
-- OpenAI-compatible endpoints: chat completions, responses, image generation, and file uploads
-- Multiple grok accounts with cookie-based auth, load balancing, and hot reload from `accounts.txt`
-- Multi-turn conversations via a local SQLite store; each turn replays prior history
-- Streaming responses
-- Inline citations: grok's `grok:render` citation markers in answers are
-  replaced with markdown links keyed on the source hostname (the mapping
-  arrives in a separate gateway event, so streamed text is held back only
-  until the URL resolves)
-- Optional bearer-token auth
+### Multi-turn Conversations
+Uses Grok's WebSocket Gateway (`wss://grok.com/ws/mgw/`) with persistent sessions.
+Follow-up messages reuse the same live gateway session — only the new user message
+is sent over the wire (not the entire conversation history). Session state is keyed
+on user-message chains so incremental calls automatically continue the right thread.
 
-## Setup
+### File Support
+Attach images (data URLs, HTTP URLs), text files (inlined into prompt), and binary
+files (uploaded via Grok's presigned upload pipeline). Supported input types:
+- Chat Completions: `image_url`, `file` content parts
+- Responses API: `input_image`, `input_file` items
 
-```bash
-# 1. Add grok.com cookies (Netscape format, one block per account)
-#    Each block needs the `sso` cookie (and usually `sso-rw`, `cf_clearance`, `x-userid`).
-vim accounts.txt
+### Image Generation
+Prompts matching image-generation intent ("generate an image of...", "draw...")
+are routed to Grok's Imagine WebSocket (`wss://grok.com/ws/imagine/listen`).
+Generated images are automatically uploaded to PixelVault and returned as
+Markdown links in the assistant response.
 
-# 2. Optional: set an API key
-echo 'GROK_OPENAI_API_KEY=secret' >> .env
+### Load Balancing
+Round-robin across all accounts in `accounts.txt`. Accounts that hit quota limits,
+auth failures, or errors get cooldown periods before being retried. The file is
+hot-reloaded on change (add/remove accounts without restarting).
+### Degraded Accounts
+Some grok accounts intermittently serve turns where the web-search tool runs
+placeholder queries unrelated to the message ("current information and recent
+sources", ...) and the model summarizes the unrelated results into word salad
+that still looks like a successful response. `grok_gateway` detects this from
+the streamed `tool_usage_card.web_search.args.query` events before the salad
+renders, aborts the turn (`kind=degraded`), fails the request over to another
+account, and quarantines the offending account for an hour. `/healthz` reports
+the count as `degraded_accounts`. If every attempt lands on a degraded account
+the request surfaces a 502 instead of garbage.
 
-# 3. Run
-./run.sh          # creates a venv, installs deps, starts on port 15553
+### Show Sources (llmcord-go)
+To feed search citations into `llmcord-go`'s **Show Sources** button:
+- Enable globally by setting `G2O_INCLUDE_SOURCES=1` (or `GROK_INCLUDE_SOURCES=1`) in `.env`.
+- Or enable per request with `"include_sources": true` in the JSON request body (e.g. in `llmcord-go`, set `extra_body: {include_sources: true}`).
+
+When enabled and Grok uses web search, an appendix formatted as:
+```markdown
+Sources
+1. [Title](url) (domain) via `query`
+
+Search Queries
+1. `query`
+```
+is appended at the end of the turn. `llmcord-go` automatically hides this appendix from the visible message while rendering and parses it to populate the **Show Sources** button and paginated sources view.
+
+## Configuration (.env)
+
+```ini
+PIXELVAULT_API_KEY=pv_live_...   # Required for image hosting
+G2O_API_KEY=                     # Optional: protect this API
+G2O_PORT=45080                   # Default port
+G2O_ACCOUNTS_FILE=accounts.txt   # Cookie file path
+G2O_COOLDOWN=300                 # Failure cooldown seconds
+G2O_SESSION_TTL=3600             # Multi-turn session TTL seconds
+G2O_INCLUDE_SOURCES=0            # Optional: enable Show Sources bridge appendix (0 or 1)
 ```
 
-Environment variables (defaults in parentheses):
+## Accounts Format
 
-| Variable | Purpose |
-| --- | --- |
-| `GROK_PORT` (`15553`) | Listen port |
-| `GROK_ACCOUNTS_FILE` (`accounts.txt`) | Cookie accounts file |
-| `GROK_DB` (`grok_sessions.db`) | SQLite session store |
-| `GROK_OPENAI_API_KEY` | If set, requires `Authorization: Bearer <key>` on chat, responses, images, and files requests. `/v1/models` and `/healthz` stay public |
-| `GROK_INCLUDE_SOURCES` (`0`) | When enabled (`1`, `true`, `yes`, `on`), append a "Sources" + "Search Queries" appendix to answers that have grok web results, for the **Show Sources** button in `llmcord-go` (see below); can also be enabled per request with `include_sources: true` |
-| `GROK_FILES_DIR` (`.openai_files`) | Storage for uploaded files |
-| `GROK_LOG` (`server.log`) | Log file used by `restart.sh` |
-| `GROK_PIDFILE` (`server.pid`) | PID file used by `restart.sh` |
+`accounts.txt` contains Netscape cookie blocks separated by optional headers:
 
-## Usage
+```
+account 1:
 
-Point any OpenAI client at it:
+# Netscape HTTP Cookie File
+.grok.com	TRUE	/	TRUE	1234567890	sso	eyJ...
+.grok.com	TRUE	/	TRUE	1234567890	sso-rw	eyJ...
+...
+
+account 2:
+...
+```
+
+Minimum required: `sso` cookie. Recommended: `sso-rw`, `x-userid`, `cf_clearance`.
+
+## Usage Examples
 
 ```bash
-curl http://localhost:15553/v1/chat/completions \
+# Simple chat
+curl http://localhost:45080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "grok-4.5", "messages": [{"role": "user", "content": "Hello"}]}'
-```
+  -d '{"model":"grok-fast","messages":[{"role":"user","content":"Hello!"}]}'
 
-Supported models: `fast`, `grok-3-mini-fast`, `grok-4.5-fast`, `grok-4.5`, `expert` (aliases map to the same set).
-
-## llmcord-go "Show Sources"
-
-When enabled, answers that have grok web results get a trailing bridge
-appendix (`Sources` + `Search Queries` sections, markdown links keyed on the
-latest user query) in the same contract the `perplexity-to-openai` proxy
-uses with `include_sources: true`. Enable globally with
-`GROK_INCLUDE_SOURCES=1` or per request with `include_sources: true` (in
-`llmcord-go`, set `extra_body: {include_sources: true}` on the provider that
-points at this proxy). Off by default so non-llmcord clients never see the
-appendix; conversation history stored for follow-up turns stays clean.
-The appendix applies to both `/v1/chat/completions` and `/v1/responses`,
-streaming and non-streaming.
-
-```bash
-curl http://localhost:15553/v1/chat/completions \
+# Streaming
+curl http://localhost:45080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "grok-4.5", "include_sources": true,
-       "messages": [{"role": "user", "content": "latest news philippines"}]}'
+  -d '{"model":"grok-fast","stream":true,"messages":[{"role":"user","content":"Hi"}]}'
+
+# Multi-turn
+curl http://localhost:45080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"grok-fast","messages":[
+    {"role":"user","content":"My name is Alice"},
+    {"role":"assistant","content":"Nice to meet you!"},
+    {"role":"user","content":"What is my name?"}
+  ]}'
+
+# Responses API with chaining
+curl http://localhost:45080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"grok-fast","input":"What is 2+2?"}'
+# Then use the response ID:
+curl http://localhost:45080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"grok-fast","previous_response_id":"resp_xxx","input":"Now multiply that by 3"}'
+
+# Image generation
+curl http://localhost:45080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"grok-fast","messages":[{"role":"user","content":"generate an image of a cat"}]}'
 ```
 
-Endpoints:
+## Architecture
 
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `POST /v1/images/generations`
-- `GET|POST /v1/files`, `GET|DELETE /v1/files/{id}`
-- `GET /v1/models`
-- `GET /healthz`, `GET /docs` (OpenAPI UI)
+```
+server.py          FastAPI app, OpenAI-compatible endpoints
+accounts.py        Account pool manager (round-robin, cooldown, hot-reload)
+statsig.py         x-statsig-id generator (pure Python, no browser needed)
+grok_gateway.py    WebSocket Gateway client (chat sessions)
+uploads.py         File upload v2 + PixelVault integration
+config.py          Environment configuration
+```
 
 ## Notes
 
-- The client inside is reverse-engineered from the grok web app and can break when grok changes its gateway.
-- Rate limits and quota are those of the accounts in `accounts.txt`; add more accounts to spread load.
-- Accounts are reloaded automatically when `accounts.txt` changes, no restart needed.
-- Some grok accounts intermittently serve degraded turns: the gateway runs its
-  web-search tool against placeholder queries unrelated to your message and
-  summarizes that content into word salad. The proxy detects the signature
-  (several distinct tool queries sharing no tokens with your message, or a
-  single known placeholder query), fails the turn over to another account
-  instead of delivering the garbage, and quarantines the account (visible as
-  `degraded_accounts` in `/healthz`) for an hour before retrying it as a last
-  resort; still-degraded accounts re-quarantine on their first turn. Replace
-  cookies of accounts that never recover. (Detection compares queries against
-  alphanumeric tokens of the last user message, so messages without such
-  tokens bypass the check.)
-- Run `restart.sh` to restart the server.
-
-Use with accounts you own. This project is not affiliated with xAI.
+- Free accounts have ~7 queries/hour for chat and limited image generations.
+- The server automatically retries on different accounts if one hits a limit.
+- Rate-limited accounts enter cooldown and are skipped until the window resets.
+- Accounts caught serving degraded (word-salad) responses are quarantined for
+  an hour; see Degraded Accounts above.
+- The `x-statsig-id` anti-bot header is generated locally in pure Python
+  (no browser or JS engine required).

@@ -1,257 +1,175 @@
-"""Account loading + load balancing for grok.com cookie accounts.
+"""Account pool: parse accounts.txt, hot-reload, round-robin load balancing.
 
-accounts.txt format: any number of "Netscape HTTP Cookie File" blocks
-(optionally separated by "account N:" headers). Each block must contain
-the `sso` cookie (and usually `sso-rw`, `cf_clearance`, `x-userid`).
-
-The pool is dynamic: the file is re-parsed whenever its mtime changes, so
-accounts can be added/removed at runtime without restarting the server.
+accounts.txt format: blocks of Netscape cookie files separated by optional
+`account N:` headers. Each block must contain an `sso` cookie line. The
+`x-userid` cookie (if present) carries the gateway user id.
 """
 from __future__ import annotations
 
 import asyncio
 import itertools
-import os
 import re
 import time
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_ACCOUNTS_FILE = Path(__file__).parent / "accounts.txt"
-
-COOKIE_RE = re.compile(r"^(\S+)\s+(TRUE|FALSE)\s+(\S+)\s+(TRUE|FALSE)\s+(\d+)\s+(\S+)\s+(\S+)\s*$")
-BLOCK_HEADER_RE = re.compile(r"^\s*account\s*\d+\s*:\s*$")
-
-# How long a degraded account stays out of rotation after one detection.
-# Bounded so a false positive costs time, not the account; re-admission via
-# pick()'s fallback is safe because the first turn after re-admission
-# re-detects before any salad is streamed.
-DEGRADED_QUARANTINE_SECONDS = 3600
+BLOCK_SPLIT = re.compile(r"(?m)^account\s+\d+:\s*$")
+INTERESTING_COOKIES = {
+    "sso", "sso-rw", "cf_clearance", "__cf_bm", "x-userid", "grok_device_id",
+}
 
 
 @dataclass
 class Account:
     index: int
-    label: str
     cookies: dict[str, str]
-    x_userid: str | None = None
-    healthy: bool = True
-    degraded: bool = False
-    in_flight: int = 0
-    consecutive_errors: int = 0
-    cooldown_until: float = 0.0
-    remaining_queries: int | None = None
-    last_error: str = ""
-    last_probe: float = 0.0
+    user_id: str = ""
 
     @property
-    def cookie_header(self) -> str:
-        return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+    def key(self) -> str:
+        uid = self.cookies.get("x-userid", "")
+        if uid:
+            return "u:" + uid
+        return "s:" + hashlib.sha256(self.cookies.get("sso", "").encode()).hexdigest()[:24]
+    cooldown_until: float = 0.0
+    degraded_until: float = 0.0
+    in_flight: int = 0
+    total_requests: int = 0
+    failed_requests: int = 0
 
-    def mark_error(self, reason: str) -> None:
-        self.consecutive_errors += 1
-        self.last_error = reason
-        backoff = min(60 * (2 ** min(self.consecutive_errors - 1, 4)), 3600)
-        self.cooldown_until = time.monotonic() + backoff
-        lower = reason.lower()
-        if "degraded account" in lower:
-            # The account's gateway serves valid-looking but unrelated
-            # content (e.g. web searches run against placeholder queries).
-            # Detection is heuristic (token overlap against the user's
-            # message), so a false positive must cost time, not the account:
-            # quarantine lasts DEGRADED_QUARANTINE_SECONDS. After expiry the
-            # first successful turn or probe (mark_success) clears the flag
-            # and returns the account to primary rotation; if the gateway is
-            # still degraded, that turn re-flags it here before any salad is
-            # delivered.
-            self.degraded = True
-            self.healthy = False
-            self.cooldown_until = time.monotonic() + DEGRADED_QUARANTINE_SECONDS
-        elif any(token in lower for token in ("401", "unauthenticated", "invalid session", "failed to look up session")):
-            self.healthy = False
-        elif self.consecutive_errors >= 3:
-            self.healthy = False
+    @property
+    def degraded(self) -> bool:
+        return time.time() < self.degraded_until
 
-    def mark_success(self) -> None:
-        self.consecutive_errors = 0
-        if self.degraded:
-            # Re-admit only once the quarantine deadline has actually passed:
-            # a success DURING quarantine (e.g. a rate-limit probe) must not
-            # shorten it. After expiry a served turn/probe succeeded, so the
-            # account has proven itself recovered; a still-degraded gateway
-            # fails its very next turn and re-enters quarantine above.
-            if time.monotonic() >= self.cooldown_until:
-                self.degraded = False
-                self.cooldown_until = 0.0
-        else:
-            self.cooldown_until = 0.0
-        self.healthy = True
+    @property
+    def sso(self) -> str:
+        return self.cookies.get("sso", "")
 
+    def cookie_header(self, extra: dict[str, str] | None = None) -> str:
+        jar = {k: v for k, v in self.cookies.items() if k in INTERESTING_COOKIES}
+        if extra:
+            jar.update(extra)
+        return "; ".join(f"{k}={v}" for k, v in jar.items())
 
-def parse_cookie_block(block: str) -> dict[str, str]:
-    cookies: dict[str, str] = {}
-    for line in block.splitlines():
-        line = line.strip()
-        if line.startswith("#HttpOnly_"):
-            # Netscape cookie exports mark HttpOnly cookies with a
-            # '#HttpOnly_' prefix; grok's sso/sso-rw session cookies are
-            # typically HttpOnly, so these lines are data, not comments.
-            line = line[len("#HttpOnly_"):]
-        elif not line or line.startswith("#"):
-            continue
-        m = COOKIE_RE.match(line)
-        if not m:
-            # space-separated fallback
-            parts = line.split()
-            if len(parts) == 7:
-                domain, sub, path, secure, exp, name, value = parts
-                cookies[name] = value
-            continue
-        domain, sub, path, secure, exp, name, value = m.groups()
-        cookies[name] = value
-    return cookies
+    def available(self) -> bool:
+        return (bool(self.sso) and time.time() >= self.cooldown_until
+                and time.time() >= self.degraded_until)
 
-
-def parse_accounts_file(text: str) -> list[dict[str, str]]:
-    """Return one cookie dict per account block found in the file."""
-    # Split on "account N:" headers; blocks are also separated by blank lines.
-    raw_blocks: list[str] = []
-    current: list[str] = []
-    for line in text.splitlines():
-        if BLOCK_HEADER_RE.match(line):
-            if current and any(l.strip() and not l.strip().startswith("#") for l in current):
-                raw_blocks.append("\n".join(current))
-            current = []
-            continue
-        if not line.strip():
-            if current and any(l.strip() and not l.strip().startswith("#") for l in current):
-                raw_blocks.append("\n".join(current))
-                current = []
-            continue
-        current.append(line)
-    if current and any(l.strip() and not l.strip().startswith("#") for l in current):
-        raw_blocks.append("\n".join(current))
-
-    accounts = []
-    for block in raw_blocks:
-        cookies = parse_cookie_block(block)
-        if not cookies:
-            continue
-        if "sso" not in cookies and "sso-rw" not in cookies:
-            continue  # not a grok session block
-        accounts.append(cookies)
-    return accounts
+    def mark_failed(self, cooldown: int) -> None:
+        self.failed_requests += 1
+        self.cooldown_until = max(self.cooldown_until, time.time() + cooldown)
 
 
 class AccountPool:
-    """Thread-safe-ish pool (used from asyncio; lock guards state)."""
-
-    def __init__(self, path: str | Path = DEFAULT_ACCOUNTS_FILE):
+    def __init__(self, path: str | Path, cooldown_seconds: int = 300):
         self.path = Path(path)
-        self._lock = asyncio.Lock()
+        self.cooldown_seconds = cooldown_seconds
         self._accounts: list[Account] = []
+        self._mtime: float = 0.0
         self._rr = itertools.count()
-        self._mtime: float | None = None
-        self.reload()
+        self._lock = asyncio.Lock()
 
-    def reload(self, force: bool = False) -> list[Account]:
+    async def reload_if_changed(self) -> None:
         try:
             mtime = self.path.stat().st_mtime
         except OSError:
-            return self._accounts
-        if not force and self._mtime == mtime:
-            return self._accounts
-        text = self.path.read_text(encoding="utf-8", errors="replace")
-        parsed = parse_accounts_file(text)
-        if not parsed:
-            raise ValueError(f"no usable grok accounts found in {self.path}")
-        self._accounts = [
-            Account(index=i, label=f"account-{i + 1}", cookies=c,
-                    x_userid=c.get("x-userid"))
-            for i, c in enumerate(parsed)
-        ]
-        self._mtime = mtime
-        return self._accounts
+            return
+        if mtime == self._mtime and self._accounts:
+            return
+        async with self._lock:
+            if mtime == self._mtime and self._accounts:
+                return
+            new_accounts = self._parse(self.path)
+            old_by_key = {a.key: a for a in self._accounts}
+            for acc in new_accounts:
+                old = old_by_key.get(acc.key)
+                if old is not None:
+                    acc.cooldown_until = old.cooldown_until
+                    acc.degraded_until = old.degraded_until
+                    acc.in_flight = old.in_flight
+                    acc.total_requests = old.total_requests
+                    acc.failed_requests = old.failed_requests
+            self._accounts = new_accounts
+            self._mtime = mtime
 
-    def maybe_reload(self) -> None:
-        try:
-            self.reload()
-        except Exception:
-            pass
+    @staticmethod
+    def _parse(path: Path) -> list[Account]:
+        if not path.exists():
+            return []
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        blocks = BLOCK_SPLIT.split(raw)
+        if not any("sso" in b for b in blocks):
+            # maybe a single cookie file without headers
+            blocks = [raw]
+        accounts: list[Account] = []
+        n = 0
+        for block in blocks:
+            block = block.strip()
+            if not block or "sso" not in block and "\t" not in block:
+                continue
+            cookies: dict[str, str] = {}
+            for line in block.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    name, value = parts[5].strip(), parts[6].strip()
+                    if name in INTERESTING_COOKIES:
+                        cookies[name] = value
+            if not cookies.get("sso"):
+                continue
+            n += 1
+            accounts.append(Account(
+                index=n,
+                cookies=cookies,
+                user_id=cookies.get("x-userid", ""),
+            ))
+        return accounts
 
-    def accounts(self) -> list[Account]:
+    def snapshot(self) -> list[Account]:
         return list(self._accounts)
 
-    def count(self) -> int:
-        return len(self._accounts)
+    def acquire(self) -> Account | None:
+        """Round-robin over available accounts (skips cooling-down ones)."""
+        accounts = [a for a in self._accounts if a.available()]
+        if not accounts:
+            # fall back to least-cooled account (excluding actively quarantined degraded ones)
+            now = time.time()
+            live = [a for a in self._accounts if a.sso and now >= a.degraded_until]
+            if not live:
+                return None
+            accounts = sorted(live, key=lambda a: a.cooldown_until)[:1]
+        idx = next(self._rr) % len(accounts)
+        acc = accounts[idx]
+        acc.total_requests += 1
+        return acc
 
-    def pick(self, exclude: list[Account] | None = None) -> Account | None:
-        """Least-loaded healthy account; round-robin breaks ties.
-
-        Accounts in `exclude` are skipped entirely so batch acquirers get
-        distinct accounts instead of stopping at the first duplicate.
-        (Account is an eq-dataclass and therefore unhashable, hence a list.)
-        """
-        self.maybe_reload()
-        now = time.monotonic()
-        healthy = [a for a in self._accounts
-                   if a.healthy and not a.degraded and a.cooldown_until <= now]
-        if not healthy:
-            # Allow cooldown-expired accounts — including degraded accounts
-            # whose quarantine deadline passed (last resort: still-degraded
-            # accounts re-trigger detection on their first turn).
-            healthy = [a for a in self._accounts if a.cooldown_until <= now]
-        if exclude:
-            healthy = [a for a in healthy if a not in exclude]
-        if not healthy:
-            return None
-        # least in_flight, then round-robin among the least-loaded group
-        min_load = min(a.in_flight for a in healthy)
-        candidates = [a for a in healthy if a.in_flight == min_load]
-        return candidates[next(self._rr) % len(candidates)]
-
-    async def acquire(self) -> Account | None:
-        async with self._lock:
-            acc = self.pick()
-            if acc:
-                acc.in_flight += 1
+    def acquire_by_key(self, key: str) -> Account | None:
+        acc = next((a for a in self._accounts if a.key == key), None)
+        if acc and acc.available():
+            acc.total_requests += 1
             return acc
+        return None
 
-    async def acquire_many(self, n: int) -> list[Account]:
-        """Acquire up to n distinct accounts (least-loaded, round-robin).
+    def release_ok(self, acc: Account) -> None:
+        acc.cooldown_until = 0.0
 
-        Returns fewer than n only when the pool cannot supply that many
-        distinct usable accounts (already-picked accounts are excluded from
-        later picks rather than stopping the sweep); an empty list means no
-        account is available at all.
-        """
-        async with self._lock:
-            picked: list[Account] = []
-            for _ in range(n):
-                acc = self.pick(exclude=picked)
-                if acc is None:
-                    break
-                acc.in_flight += 1
-                picked.append(acc)
-            return picked
-
-    def release(self, acc: Account) -> None:
-        if acc.in_flight > 0:
-            acc.in_flight -= 1
-
-    def report_success(self, acc: Account) -> None:
-        acc.mark_success()
-
-    def report_failure(self, acc: Account, reason: str) -> None:
-        acc.mark_error(reason)
-
-
-def load_accounts(path: str | Path = DEFAULT_ACCOUNTS_FILE) -> list[dict[str, str]]:
-    return parse_accounts_file(Path(path).read_text(encoding="utf-8", errors="replace"))
-
-
-if __name__ == "__main__":
-    accts = load_accounts()
-    print(f"parsed {len(accts)} accounts")
-    for i, a in enumerate(accts):
-        print(f"  {i + 1}: userid={a.get('x-userid', '?')} cookies={len(a)}")
+    def release_fail(self, acc: Account, kind: str = "generic") -> None:
+        cooldown = self.cooldown_seconds
+        if kind == "auth":
+            cooldown = max(cooldown, 1800)
+        elif kind == "quota":
+            # retry after the top-of-hour window typically used by grok
+            now = time.time()
+            until_next_hour = 3600 - (now % 3600) + 60
+            cooldown = max(cooldown, min(until_next_hour, 3600))
+        elif kind == "degraded":
+            # Degraded gateways serve word salad as successful turns; quarantine
+            # the account for an hour so real traffic stops routing through it.
+            # release_ok must not clear this deadline; after it lapses the
+            # account is re-admitted and the first turn re-detects degradation.
+            cooldown = max(cooldown, 3600)
+            acc.degraded_until = max(acc.degraded_until, time.time() + cooldown)
+        acc.mark_failed(cooldown)

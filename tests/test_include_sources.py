@@ -1,19 +1,22 @@
 """Tests for the optional "Show Sources" bridge (include_sources).
 
-Pins the perplexity-to-openai-style appendix contract: enabled only via
-`include_sources: true` (or GROK_INCLUDE_SOURCES=1), appended after the
-answer/image content, with the stored conversation history kept clean.
-Run:  ./.venv/bin/python -m unittest -v tests.test_include_sources
+Pins the llmcord-go-compatible appendix contract: enabled only via
+`include_sources: true` (or G2O_INCLUDE_SOURCES=1), appended after the
+answer content, with the stored session history kept clean.
+Run: python3 -m unittest -v tests.test_include_sources
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import server
-from grok_client import GrokTurn
+from accounts import Account
+from grok_gateway import GrokSession, TurnResult, extract_web_results
 
 SOURCES = [
     {"url": "https://example.com/news", "title": "Example News"},
@@ -34,29 +37,12 @@ APPENDIX = (
 class FakeRequest:
     """Minimal duck-typed Request for the endpoint handlers."""
 
-    def __init__(self, body):
+    def __init__(self, body: dict):
         self._body = body
         self.headers = {}
 
     async def json(self):
         return self._body
-
-
-class FakeStore:
-    """Stands in for server.store: no sqlite, no rows."""
-
-    def __init__(self, row=None):
-        self.row = row
-        self.updated = []
-
-    def get_session(self, key):
-        return self.row
-
-    def register_response(self, rid, key):
-        pass
-
-    def update_session(self, key, conversation_id, history):
-        self.updated.append((key, conversation_id, history))
 
 
 class SourceAppendixTest(unittest.TestCase):
@@ -79,8 +65,8 @@ class SourceAppendixTest(unittest.TestCase):
 
     def test_url_parens_and_spaces_escaped(self):
         out = server._source_appendix(
-            [{"url": "https://x.io/a(b c)d", "title": "T"}], "q")
-        self.assertIn("https://x.io/a%28b%20c%29d", out)
+            [{"url": "https://x.io/a b)c", "title": "T"}], "q")
+        self.assertIn("https://x.io/a%20b%29c", out)
 
     def test_query_backticks_sanitized(self):
         out = server._source_appendix(SOURCES[:1], "what's `up`")
@@ -110,13 +96,13 @@ class SourceAppendixTest(unittest.TestCase):
 
 
 class IncludeSourcesFlagTest(unittest.TestCase):
-    def test_flag_none_uses_env_default(self):
+    def test_flag_none_uses_config_default(self):
         with patch("server.INCLUDE_SOURCES", True):
             self.assertTrue(server._include_sources(None))
         with patch("server.INCLUDE_SOURCES", False):
             self.assertFalse(server._include_sources(None))
 
-    def test_flag_overrides_env_default(self):
+    def test_flag_overrides_config_default(self):
         with patch("server.INCLUDE_SOURCES", True):
             self.assertFalse(server._include_sources(False))
         with patch("server.INCLUDE_SOURCES", False):
@@ -128,133 +114,188 @@ class IncludeSourcesFlagTest(unittest.TestCase):
         for falsy in ("0", "false", "no", "off", "", "garbage"):
             self.assertFalse(server._include_sources(falsy))
 
+    def test_env_var_grok_include_sources_fallback(self):
+        import importlib
+        import os
+        import config
 
-class WebSourcesTest(unittest.TestCase):
-    EVENT_SEARCH = {"type": "response.search.result", "result": {
+        with patch.dict(os.environ, {"GROK_INCLUDE_SOURCES": "1"}, clear=False):
+            os.environ.pop("G2O_INCLUDE_SOURCES", None)
+            importlib.reload(config)
+            self.assertTrue(config.INCLUDE_SOURCES)
+
+        with patch.dict(os.environ, {"G2O_INCLUDE_SOURCES": "0", "GROK_INCLUDE_SOURCES": "1"}, clear=False):
+            importlib.reload(config)
+            self.assertFalse(config.INCLUDE_SOURCES)
+
+        # Restore default state
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("G2O_INCLUDE_SOURCES", None)
+            os.environ.pop("GROK_INCLUDE_SOURCES", None)
+            importlib.reload(config)
+            importlib.reload(server)
+
+
+class WebSourcesExtractionTest(unittest.TestCase):
+    EVENT_SEARCH = {"event": {"type": "response.search.result"}, "result": {
         "search_type": "web_search",
         "web_results": [{"url": "https://a.io/1", "title": "A"}]}}
 
-    EVENT_TOOL = {"type": "response.grok.output", "output": {"tool_result": {
+    EVENT_TOOL = {"event": {"type": "response.grok.output"}, "output": {"tool_result": {
         "web_search_results": [{"url": "https://b.io/2", "title": " B "}]}}}
 
-    EVENT_TOOL_SAME_URL = {"type": "response.grok.output", "output": {
-        "tool_result": {"web_search_results": [
-            {"url": "https://a.io/1", "title": "A again"}]}}}
+    EVENT_CHUNK = {"event": {"type": "response.chunk"}, "chunk": {"tool_result": {
+        "web_search_results": [{"url": "https://c.io/3", "title": "C"}]}}}
+
+    EVENT_CHUNK_LIVE_WEBPAGES = {"event": {"type": "response.chunk"}, "chunk": {"tool_result": {
+        "tool_call_id": "call-1",
+        "web_search": {"webpages": [
+            {"url": "https://live.news/article", "title": "Live News", "snippet": "Snippet text"}
+        ]}
+    }}}
 
     def test_search_result_event_extracts_entries(self):
-        self.assertEqual(GrokTurn._web_results(self.EVENT_SEARCH),
+        self.assertEqual(extract_web_results(self.EVENT_SEARCH),
                          [{"url": "https://a.io/1", "title": "A"}])
 
-    def test_tool_result_event_extracts_entries(self):
-        self.assertEqual(GrokTurn._web_results(self.EVENT_TOOL),
+    def test_tool_result_output_event_extracts_entries(self):
+        self.assertEqual(extract_web_results(self.EVENT_TOOL),
                          [{"url": "https://b.io/2", "title": "B"}])
+
+    def test_tool_result_chunk_event_extracts_entries(self):
+        self.assertEqual(extract_web_results(self.EVENT_CHUNK),
+                         [{"url": "https://c.io/3", "title": "C"}])
+
+    def test_tool_result_live_webpages_shape_extracts_entries(self):
+        self.assertEqual(extract_web_results(self.EVENT_CHUNK_LIVE_WEBPAGES),
+                         [{"url": "https://live.news/article", "title": "Live News"}])
 
     def test_title_falls_back_to_url(self):
         ev = {"result": {"web_results": [{"url": "https://d.io/4"}]}}
-        self.assertEqual(GrokTurn._web_results(ev),
+        self.assertEqual(extract_web_results(ev),
                          [{"url": "https://d.io/4", "title": "https://d.io/4"}])
 
     def test_malformed_entries_ignored(self):
         ev = {"result": {"web_results": [
             None, {"url": " "}, {"url": "https://e.io/5", "title": 3}]}}
-        self.assertEqual(GrokTurn._web_results(ev),
+        self.assertEqual(extract_web_results(ev),
                          [{"url": "https://e.io/5", "title": "3"}])
 
     def test_unrelated_event_yields_nothing(self):
-        self.assertEqual(GrokTurn._web_results({"type": "response.done"}), [])
-
-    def test_prefers_result_shape_when_both_present(self):
-        ev = {"result": {"web_results": [{"url": "https://r.io/1", "title": "R"}]},
-              "output": {"tool_result": {"web_search_results": [
-                  {"url": "https://t.io/2", "title": "T"}]}}}
-        self.assertEqual(GrokTurn._web_results(ev),
-                         [{"url": "https://r.io/1", "title": "R"}])
-
-    def test_falls_back_to_output_shape_when_result_shape_empty(self):
-        ev = {"result": {"web_results": []},
-              "output": {"tool_result": {"web_search_results": [
-                  {"url": "https://t.io/2", "title": "T"}]}}}
-        self.assertEqual(GrokTurn._web_results(ev),
-                         [{"url": "https://t.io/2", "title": "T"}])
-
-    def test_dedupe_across_event_shapes(self):
-        turn = object.__new__(GrokTurn)
-        sources, seen = [], set()
-        turn._collect_sources(self.EVENT_SEARCH, sources, seen)
-        turn._collect_sources(self.EVENT_TOOL, sources, seen)
-        turn._collect_sources(self.EVENT_TOOL_SAME_URL, sources, seen)
-        self.assertEqual(sources, [
-            {"url": "https://a.io/1", "title": "A"},
-            {"url": "https://b.io/2", "title": "B"},
-        ])
+        self.assertEqual(extract_web_results({"event": {"type": "response.done"}}), [])
 
 
-async def fake_run_turn(key, model, history, on_delta):
-    await on_delta("answer text", {})
-    return "answer text", [], SOURCES
+class GatewaySessionAskSourcesTest(unittest.IsolatedAsyncioTestCase):
+    async def test_ask_collects_sources_and_search_queries_into_turn_result(self):
+        from websockets.protocol import State
+
+        frames = [
+            {"event": {"type": "conversation.item.added", "item": {"role": "user", "id": "umsg"}}},
+            {"event": {"type": "response.chunk", "chunk": {
+                "tool_usage_card": {"web_search": {"args": {"query": "latest news philippines"}}}}}},
+            {"event": {"type": "response.search.result"}, "result": {
+                "web_results": [
+                    {"url": "https://example.com/news", "title": "Example News"},
+                    {"url": "https://x.com/agency/status/1", "title": "Agency post"}
+                ]}},
+            {"event": {"type": "response.output_text.delta", "delta": "Here is the news."}},
+            {"event": {"type": "response.done", "response": {"id": "resp-1", "status": "completed"}}},
+        ]
+
+        class MockWS:
+            def __init__(self):
+                self.protocol = SimpleNamespace(state=State.OPEN)
+                self._frames = list(frames)
+            async def send(self, msg):
+                pass
+            async def recv(self):
+                if not self._frames:
+                    raise asyncio.TimeoutError()
+                return json.dumps(self._frames.pop(0))
+            async def close(self):
+                pass
+
+        sess = GrokSession("ck", "uid")
+        sess.conversation_id = "conv-1"
+        sess.ws = MockWS()
+
+        done_event = None
+        async for ev in sess.ask("latest news philippines", user_text="latest news philippines"):
+            if ev.get("type") == "done":
+                done_event = ev
+
+        self.assertIsNotNone(done_event)
+        result: TurnResult = done_event["result"]
+        self.assertEqual(result.text, "Here is the news.")
+        self.assertEqual(result.sources, SOURCES)
+        self.assertEqual(result.search_queries, ["latest news philippines"])
 
 
-class ChatCompletionsAppendixTest(unittest.IsolatedAsyncioTestCase):
-    async def test_non_stream_appends_when_requested(self):
-        body = {"model": "grok-4.5", "include_sources": True,
-                "messages": [{"role": "user", "content": "latest news philippines"}]}
-        with (
-            patch("server._run_turn", new=AsyncMock(side_effect=fake_run_turn)),
-            patch("server._host_images", new=AsyncMock(return_value=[])),
-        ):
+class ChatCompletionsAppendixEndpointTest(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_non_stream_appends_sources_when_requested(self):
+        body = {
+            "model": "grok-fast",
+            "include_sources": True,
+            "messages": [{"role": "user", "content": "latest news philippines"}],
+        }
+        fake_result = TurnResult(
+            text="Here is the news.",
+            sources=SOURCES,
+            search_queries=["latest news philippines"],
+        )
+        fake_acc = Account(index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1")
+        fake_state = server.SessionState(account_key=fake_acc.key, grok=AsyncMock())
+
+        with patch("server.pick_account_and_turn",
+                   new=AsyncMock(return_value=(fake_acc, fake_result, [], fake_state))), \
+             patch("server.refresh_statsig_pair", new=AsyncMock()):
             resp = await server.chat_completions(FakeRequest(body))
-        content = resp["choices"][0]["message"]["content"]
-        self.assertEqual(content, "answer text" + APPENDIX)
 
-    async def test_non_stream_omits_by_default(self):
-        body = {"model": "grok-4.5",
-                "messages": [{"role": "user", "content": "latest news philippines"}]}
-        with (
-            patch("server._run_turn", new=AsyncMock(side_effect=fake_run_turn)),
-            patch("server._host_images", new=AsyncMock(return_value=[])),
-        ):
+        data = json.loads(resp.body)
+        self.assertEqual(data["choices"][0]["message"]["content"], "Here is the news." + APPENDIX)
+
+    async def test_chat_non_stream_omits_sources_by_default(self):
+        body = {
+            "model": "grok-fast",
+            "messages": [{"role": "user", "content": "latest news philippines"}],
+        }
+        fake_result = TurnResult(
+            text="Here is the news.",
+            sources=SOURCES,
+            search_queries=["latest news philippines"],
+        )
+        fake_acc = Account(index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1")
+        fake_state = server.SessionState(account_key=fake_acc.key, grok=AsyncMock())
+
+        with patch("server.pick_account_and_turn",
+                   new=AsyncMock(return_value=(fake_acc, fake_result, [], fake_state))), \
+             patch("server.refresh_statsig_pair", new=AsyncMock()):
             resp = await server.chat_completions(FakeRequest(body))
-        self.assertEqual(resp["choices"][0]["message"]["content"], "answer text")
 
-    async def test_non_stream_env_flag_enables_without_body_field(self):
-        body = {"model": "grok-4.5",
-                "messages": [{"role": "user", "content": "latest news philippines"}]}
-        with (
-            patch("server.INCLUDE_SOURCES", True),
-            patch("server._run_turn", new=AsyncMock(side_effect=fake_run_turn)),
-            patch("server._host_images", new=AsyncMock(return_value=[])),
-        ):
-            resp = await server.chat_completions(FakeRequest(body))
-        self.assertEqual(resp["choices"][0]["message"]["content"],
-                         "answer text" + APPENDIX)
+        data = json.loads(resp.body)
+        self.assertEqual(data["choices"][0]["message"]["content"], "Here is the news.")
 
-    async def test_non_stream_appendix_follows_image_tail(self):
-        body = {"model": "grok-4.5", "include_sources": True,
-                "messages": [{"role": "user", "content": "latest news philippines"}]}
-        async def run_turn_with_images(key, model, history, on_delta):
-            await on_delta("answer text", {})
-            return "answer text", [{"url": "https://pv.test/img.png"}], SOURCES
-        with (
-            patch("server._run_turn", new=AsyncMock(side_effect=run_turn_with_images)),
-            patch("server._host_images",
-                  new=AsyncMock(return_value=["https://pv.test/img.png"])),
-        ):
-            resp = await server.chat_completions(FakeRequest(body))
-        content = resp["choices"][0]["message"]["content"]
-        self.assertTrue(content.startswith("answer text"))
-        self.assertLess(content.index("![image](https://pv.test/img.png)"),
-                        content.index("\n\nSources\n1. ["))
-        self.assertTrue(content.endswith(APPENDIX))
+    async def test_chat_stream_appends_sources_chunk(self):
+        body = {
+            "model": "grok-fast",
+            "stream": True,
+            "include_sources": True,
+            "messages": [{"role": "user", "content": "latest news philippines"}],
+        }
+        fake_result = TurnResult(
+            text="Here is the news.",
+            sources=SOURCES,
+            search_queries=["latest news philippines"],
+        )
+        fake_acc = Account(index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1")
+        fake_state = server.SessionState(account_key=fake_acc.key, grok=AsyncMock())
 
-    async def test_stream_appends_final_chunk(self):
-        body = {"model": "grok-4.5", "stream": True, "include_sources": True,
-                "messages": [{"role": "user", "content": "latest news philippines"}]}
-        with (
-            patch("server._run_turn", new=AsyncMock(side_effect=fake_run_turn)),
-            patch("server._host_images", new=AsyncMock(return_value=[])),
-        ):
+        with patch("server.pick_account_and_turn",
+                   new=AsyncMock(return_value=(fake_acc, fake_result, [], fake_state))), \
+             patch("server.refresh_statsig_pair", new=AsyncMock()):
             resp = await server.chat_completions(FakeRequest(body))
             chunks = [c async for c in resp.body_iterator]
+
         contents = []
         for chunk in chunks:
             line = chunk.strip()
@@ -263,47 +304,55 @@ class ChatCompletionsAppendixTest(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(line[len("data: "):])
             if payload.get("object") != "chat.completion.chunk":
                 continue
-            contents.append(payload["choices"][0]["delta"].get("content", ""))
-        self.assertEqual("".join(contents), "answer text" + APPENDIX)
+            delta = payload["choices"][0]["delta"]
+            if "content" in delta:
+                contents.append(delta["content"])
+
+        self.assertEqual("".join(contents), "Here is the news." + APPENDIX)
 
 
-class ResponsesAppendixTest(unittest.IsolatedAsyncioTestCase):
-    INPUT = [{"role": "user", "content": [
-        {"type": "input_text", "text": "latest news philippines"}]}]
+class ResponsesApiAppendixEndpointTest(unittest.IsolatedAsyncioTestCase):
+    async def test_responses_non_stream_appends_sources_when_requested(self):
+        body = {
+            "model": "grok-fast",
+            "include_sources": True,
+            "input": "latest news philippines",
+        }
+        fake_result = TurnResult(
+            text="Here is the news.",
+            sources=SOURCES,
+            search_queries=["latest news philippines"],
+        )
+        fake_acc = Account(index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1")
+        fake_state = server.SessionState(account_key=fake_acc.key, grok=AsyncMock())
 
-    async def test_non_stream_appends_when_requested(self):
-        body = {"model": "grok-4.5", "include_sources": True, "input": self.INPUT}
-        store = FakeStore(row={"conversation_id": "conv-1", "history": []})
-        with (
-            patch("server._run_turn", new=AsyncMock(side_effect=fake_run_turn)),
-            patch("server._host_images", new=AsyncMock(return_value=[])),
-            patch("server.store", store),
-        ):
+        with patch("server.pick_account_and_turn",
+                   new=AsyncMock(return_value=(fake_acc, fake_result, [], fake_state))), \
+             patch("server.refresh_statsig_pair", new=AsyncMock()):
             resp = await server.responses_api(FakeRequest(body))
-        self.assertEqual(resp["output"][0]["content"][0]["text"],
-                         "answer text" + APPENDIX)
-        # follow-up history keeps the clean answer: no appendix
-        stored = store.updated[-1][2][-1]
-        self.assertEqual(stored["parts"][0]["text"], "answer text")
 
-    async def test_non_stream_omits_by_default(self):
-        body = {"model": "grok-4.5", "input": self.INPUT}
-        with (
-            patch("server._run_turn", new=AsyncMock(side_effect=fake_run_turn)),
-            patch("server._host_images", new=AsyncMock(return_value=[])),
-            patch("server.store", FakeStore()),
-        ):
-            resp = await server.responses_api(FakeRequest(body))
-        self.assertEqual(resp["output"][0]["content"][0]["text"], "answer text")
+        data = json.loads(resp.body)
+        self.assertEqual(data["output"][0]["content"][0]["text"], "Here is the news." + APPENDIX)
+        self.assertEqual(data["output_text"], "Here is the news." + APPENDIX)
 
-    async def test_stream_appends_to_done_and_completed(self):
-        body = {"model": "grok-4.5", "stream": True, "include_sources": True,
-                "input": self.INPUT}
-        with (
-            patch("server._run_turn", new=AsyncMock(side_effect=fake_run_turn)),
-            patch("server._host_images", new=AsyncMock(return_value=[])),
-            patch("server.store", FakeStore()),
-        ):
+    async def test_responses_stream_appends_sources_in_events(self):
+        body = {
+            "model": "grok-fast",
+            "stream": True,
+            "include_sources": True,
+            "input": "latest news philippines",
+        }
+        fake_result = TurnResult(
+            text="Here is the news.",
+            sources=SOURCES,
+            search_queries=["latest news philippines"],
+        )
+        fake_acc = Account(index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1")
+        fake_state = server.SessionState(account_key=fake_acc.key, grok=AsyncMock())
+
+        with patch("server.pick_account_and_turn",
+                   new=AsyncMock(return_value=(fake_acc, fake_result, [], fake_state))), \
+             patch("server.refresh_statsig_pair", new=AsyncMock()):
             resp = await server.responses_api(FakeRequest(body))
             events = {}
             for chunk in [c async for c in resp.body_iterator]:
@@ -316,16 +365,16 @@ class ResponsesAppendixTest(unittest.IsolatedAsyncioTestCase):
                         continue
                     payload = json.loads(data)
                     events.setdefault(payload["type"], []).append(payload)
+
         deltas = "".join(
-            p["delta"] for p in events["response.output_text.delta"])
+            p["delta"] for p in events["response.output_text.delta"]
+        )
+        self.assertEqual(deltas, "Here is the news." + APPENDIX)
         done = events["response.output_item.done"][0]
         completed = events["response.completed"][0]
-        self.assertEqual(deltas, "answer text")
-        self.assertEqual(done["item"]["content"][0]["text"],
-                         "answer text" + APPENDIX)
-        self.assertEqual(completed["response"]["output"][0]["content"][0]["text"],
-                         "answer text" + APPENDIX)
+        self.assertEqual(done["item"]["content"][0]["text"], "Here is the news." + APPENDIX)
+        self.assertEqual(completed["response"]["output"][0]["content"][0]["text"], "Here is the news." + APPENDIX)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

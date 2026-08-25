@@ -1,756 +1,143 @@
-"""OpenAI-compatible FastAPI facade for grok.com.
+"""Grok → OpenAI-compatible API server.
 
-The upstream chat transport is grok's JSON WebSocket gateway. Each request
-uses real conversation items (text and uploaded files), while local SQLite
-state supplies prior turns when an OpenAI client sends a follow-up. The
-upstream gateway's conversation attach operation is not reliable for
-sessions created by this client, so each turn uses a fresh upstream session
-and replays history as separate items; this is deliberately not one prompt.
+Endpoints:
+  POST /v1/chat/completions   (stream + non-stream)
+  POST /v1/responses          (stream + non-stream, previous_response_id chaining)
+  GET  /v1/models
+  GET  /healthz
+
+Chat runs over Grok's WebSocket Gateway (fast path, no browser). Multi-turn
+conversations are real grok conversations: incremental requests reuse the
+existing gateway session (conversation attach + parent_response_id), sending
+only the newest user message.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import hashlib
-import ipaddress
-import json
 import logging
-import mimetypes
+import json
 import os
 import re
+import struct
 import time
 import uuid
-from contextlib import asynccontextmanager
-from typing import Any
-from urllib.parse import urlparse
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator
 
-import httpx
-from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from accounts import Account, AccountPool
-from files import mime_from_name, parse_data_url, upload_bytes
-from grok_client import GrokError, GrokSessionManager, GrokTurn, normalize_model
-from grok_imagine import aspect_ratio, generate_images
-from openai_files import OpenAIFileStore
-from pixelvault import pixelvault_url
-from session_store import SessionStore, new_id
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("grok.server")
-
-PORT = int(os.environ.get("GROK_PORT", "15553"))
-HOST = os.environ.get("GROK_HOST", "127.0.0.1")
-ACCOUNTS_FILE = os.environ.get("GROK_ACCOUNTS_FILE", "accounts.txt")
-DB_PATH = os.environ.get("GROK_DB", "grok_sessions.db")
-API_KEY = os.environ.get("GROK_OPENAI_API_KEY") or None
-INCLUDE_SOURCES = os.environ.get("GROK_INCLUDE_SOURCES", "0").strip().lower() in ("1", "true", "yes", "on")
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
-HTTP_TIMEOUT = httpx.Timeout(120.0, connect=20.0)
-
-pool = AccountPool(ACCOUNTS_FILE)
-store = SessionStore(DB_PATH)
-manager = GrokSessionManager()
-file_store = OpenAIFileStore(os.environ.get("GROK_FILES_DIR", ".openai_files"))
-
-class _ClientLockEntry:
-    """A per-key lock plus the number of active/waiting request owners."""
-
-    __slots__ = ("lock", "users")
-
-    def __init__(self) -> None:
-        self.lock = asyncio.Lock()
-        self.users = 0
+import config
+from config import API_KEY, COOLDOWN_SECONDS, DEFAULT_MODEL, GROK_BASE, PORT, \
+    SESSION_TTL, MAX_SESSIONS, USER_AGENT, INCLUDE_SOURCES
+from accounts import AccountPool
+from statsig import StatsigGenerator, STATSIG_EPOCH, SALT, compute_animation_hex, curves_to_path
 
 
-# Entries live only while a request is queued for or inside the critical
-# section. This bounds memory by concurrent request keys rather than leaking
-# one asyncio.Lock for every conversation ever seen.
-_client_locks: dict[str, _ClientLockEntry] = {}
+from uploads import UploadError, decode_data_url, guess_mime, pixelvault_upload, \
+    pixelvault_upload_from_url, upload_file
+import grok_gateway as gw
+from grok_gateway import GrokSession, GatewayError, TurnResult
+
+app = FastAPI(title="grok-to-openai-api", version="1.0")
+
+pool = AccountPool(config.ACCOUNTS_FILE, cooldown_seconds=COOLDOWN_SECONDS)
+statsig = StatsigGenerator()
 
 
-@asynccontextmanager
-async def _client_lock(key: str):
-    """Serialize requests for `key` and remove the entry after its last user."""
-    entry = _client_locks.get(key)
-    if entry is None:
-        entry = _ClientLockEntry()
-        _client_locks[key] = entry
-    entry.users += 1
-    try:
-        async with entry.lock:
-            yield
-    finally:
-        entry.users -= 1
-        if entry.users == 0 and _client_locks.get(key) is entry:
-            del _client_locks[key]
+# ---------------------------------------------------------------- session map
+
+@dataclass
+class SessionState:
+    account_key: str            # owning account key
+    grok: GrokSession           # live gateway session (one per conversation)
+    user_chain: list[str] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+    last_used: float = field(default_factory=time.time)
+
+    def touch(self) -> None:
+        self.last_used = time.time()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("grok-openai proxy starting with %d accounts", pool.count())
-    reload_task = asyncio.create_task(_reload_loop())
-    probe_task = asyncio.create_task(_probe_loop())
-    yield
-    reload_task.cancel()
-    probe_task.cancel()
-    await manager.close_all()
+SESSIONS: dict[str, SessionState] = {}
+SESSION_LOCK = asyncio.Lock()
 
 
-app = FastAPI(title="grok-to-openai", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-async def _reload_loop():
-    while True:
-        await asyncio.sleep(5)
+async def prune_sessions() -> None:
+    now = time.time()
+    to_close = []
+    async with SESSION_LOCK:
+        stale_keys = [k for k, v in SESSIONS.items() if now - v.last_used > SESSION_TTL]
+        for k in stale_keys:
+            st = SESSIONS.pop(k, None)
+            if st:
+                to_close.append(st.grok)
+        if len(SESSIONS) > MAX_SESSIONS:
+            sorted_sessions = sorted(SESSIONS.items(), key=lambda item: item[1].last_used)
+            excess = len(SESSIONS) - MAX_SESSIONS
+            for k, st in sorted_sessions[:excess]:
+                SESSIONS.pop(k, None)
+                to_close.append(st.grok)
+    for g in to_close:
         try:
-            before = pool.count()
-            pool.reload()
-            if before != pool.count():
-                log.info("accounts.txt changed: %d -> %d accounts", before, pool.count())
-        except Exception as exc:
-            log.warning("account reload failed: %s", exc)
-
-
-async def _probe_loop():
-    # REST rate-limit checks do not create expensive chat sessions. Probes
-    # run concurrently over one shared client (connection pooling, no serial
-    # handshakes), and unhealthy accounts are re-probed every 60s so a
-    # recovered account rejoins rotation within a minute instead of five.
-    while True:
-        try:
-            now = time.monotonic()
-            due = [a for a in pool.accounts()
-                   if a.last_probe == 0 or now - a.last_probe >= (60 if not a.healthy else 1800)]
-            if due:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    # Probe in small parallel batches: a startup/reload burst
-                    # of 20 accounts hitting the REST endpoint at once could
-                    # look like scraping. Each probe isolates its own
-                    # exceptions, so one failure cannot abort the batch.
-                    for i in range(0, len(due), 8):
-                        await asyncio.gather(*(_probe_account(a, client) for a in due[i:i + 8]))
-        except Exception as exc:
-            log.warning("account probe loop failed: %s", exc)
-        await asyncio.sleep(60)
-
-
-async def _probe_account(account: Account, client: httpx.AsyncClient) -> None:
-    account.last_probe = time.monotonic()
-    try:
-        response = await client.post(
-            "https://grok.com/rest/rate-limits",
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36",
-                "Cookie": account.cookie_header,
-                "Origin": "https://grok.com",
-                "Content-Type": "application/json",
-            },
-            json={"modelName": "fast"},
-        )
-        if response.status_code == 200:
-            data = response.json()
-            remaining = data.get("remainingQueries")
-            if remaining is not None:
-                account.remaining_queries = int(remaining)
-            if remaining is not None and remaining <= 0:
-                # Keep the account out of rotation until quota resets;
-                # the probe loop revives it (healthy=False -> 60s probes).
-                # A long cooldown stops pick()'s fallback from re-selecting
-                # it while every account is exhausted.
-                account.healthy = False
-                pool.report_failure(account, "quota exhausted (0 remaining queries)")
-                account.cooldown_until = time.monotonic() + 3600
-            else:
-                pool.report_success(account)
-        else:
-            pool.report_failure(account, f"rate-limit probe HTTP {response.status_code}")
-    except Exception as exc:
-        pool.report_failure(account, f"rate-limit probe: {exc}")
-
-
-async def _check_auth(request: Request) -> None:
-    if API_KEY is not None and request.headers.get("Authorization") != f"Bearer {API_KEY}":
-        raise GrokError("invalid API key", code=401, kind="auth_error")
-
-
-# ---------------------------------------------------------------------------
-# Conversation keys and normalized input
-# ---------------------------------------------------------------------------
-
-
-def _hash(*parts: str) -> str:
-    h = hashlib.sha256()
-    for part in parts:
-        h.update(str(part).encode("utf-8", errors="replace"))
-        h.update(b"\0")
-    return h.hexdigest()[:24]
-
-
-def _item_text(item: dict) -> str:
-    return "".join(
-        p.get("text", "") for p in item.get("parts", [])
-        if p.get("type") in ("text", "input_text")
-    )
-
-
-def _first_user_text(items: list[dict]) -> str:
-    for item in items:
-        if item.get("role") in ("user", "developer"):
-            return _item_text(item)[:300]
-    return ""
-
-
-def _chat_key(model: str, history: list[dict], user: str | None) -> str:
-    return f"chat:user:{_hash(user)}" if user else f"chat:auto:{_hash(model, _first_user_text(history))}"
-
-
-def _responses_key(model: str, items: list[dict], user: str | None,
-                   previous_response_id: str | None) -> str:
-    if previous_response_id:
-        found = store.client_key_for_response(previous_response_id)
-        if found:
-            return found
-    return f"resp:user:{_hash(user)}" if user else f"resp:auto:{_hash(model, _first_user_text(items))}"
-
-
-def _chat_parts(message: dict) -> list[dict]:
-    content = message.get("content")
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    if content is None:
-        return [{"type": "text", "text": ""}]
-    if not isinstance(content, list):
-        return [{"type": "text", "text": str(content)}]
-    parts = []
-    for part in content:
-        if isinstance(part, str):
-            parts.append({"type": "text", "text": part})
-        elif isinstance(part, dict):
-            ptype = part.get("type")
-            if ptype in ("text", "input_text"):
-                parts.append({"type": "text", "text": part.get("text", "")})
-            elif ptype in ("image_url", "file", "input_file", "file_url"):
-                parts.append(part)
-            else:
-                parts.append({"type": "text", "text": json.dumps(part)})
-    return parts or [{"type": "text", "text": ""}]
-
-
-async def _responses_items(input_data: Any) -> list[dict]:
-    if isinstance(input_data, str):
-        return [{"role": "user", "parts": [{"type": "text", "text": input_data}]}]
-    if isinstance(input_data, dict):
-        input_data = [input_data]
-    items: list[dict] = []
-    for raw in input_data or []:
-        if not isinstance(raw, dict):
-            continue
-        ptype = raw.get("type", "message")
-        if ptype == "message":
-            role = raw.get("role", "user")
-            role = "system" if role in ("system", "developer") else role
-            content = raw.get("content", [])
-            content = content if isinstance(content, list) else [content]
-            parts = []
-            for part in content:
-                if isinstance(part, str):
-                    parts.append({"type": "text", "text": part})
-                elif isinstance(part, dict):
-                    p = dict(part)
-                    if p.get("type") == "input_image":
-                        # OpenAI inputs reference uploaded images either by
-                        # URL/data URL or by local file_id (post /v1/files).
-                        # A file_id is resolved through the local store the
-                        # same way input_file parts are; dropping it here
-                        # silently loses the image upstream.
-                        if p.get("file_id"):
-                            # Carry any inline URL/data as a fallback: a
-                            # file_id that fails to resolve upstream (or is
-                            # absent from the local store) must not torpedo
-                            # a request that also supplied a usable image.
-                            img = p.get("image_url") or p.get("image_data")
-                            if isinstance(img, dict):
-                                img = img.get("url")
-                            is_data = isinstance(img, str) and img.startswith("data:")
-                            parts.append({
-                                "type": "input_file",
-                                "file_id": p.get("file_id"),
-                                "filename": p.get("filename"),
-                                "file": {"data": img if is_data else None,
-                                         "url": img if not is_data else None,
-                                         "filename": p.get("filename"),
-                                         "mime_type": p.get("mime_type")},
-                            })
-                        else:
-                            url = p.get("image_url") or p.get("image_data")
-                            parts.append({"type": "image_url", "image_url": url})
-                    elif p.get("type") == "input_file":
-                        parts.append({
-                            "type": "input_file",
-                            "file_id": p.get("file_id"),
-                            "filename": p.get("filename"),
-                            "file": {
-                                "data": p.get("file_data"),
-                                "url": p.get("file_url"),
-                                "filename": p.get("filename"),
-                                "mime_type": p.get("mime_type"),
-                            },
-                        })
-                    else:
-                        parts.append(p)
-            items.append({"role": role, "parts": parts})
-        elif ptype in ("function_call", "function_call_output", "reasoning"):
-            role = "assistant" if ptype != "function_call_output" else "user"
-            items.append({"role": role, "parts": [{"type": "text", "text": json.dumps(raw)}]})
-    return items or [{"role": "user", "parts": [{"type": "text", "text": ""}]}]
-
-
-async def _download_url(url: str) -> tuple[bytes, str]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        if len(response.content) > MAX_ATTACHMENT_BYTES:
-            raise GrokError("attachment exceeds 20 MiB", code=400, kind="file_too_large")
-        return response.content, response.headers.get("content-type", "application/octet-stream").split(";")[0]
-
-
-async def _file_part(account: Account, part: dict) -> dict:
-    inner = part.get("file")
-    if inner is None and part.get("file_data") is not None:
-        inner = {"data": part.get("file_data"), "filename": part.get("filename"),
-                 "mime_type": part.get("mime_type")}
-    inner = inner or {}
-    if not isinstance(inner, dict):
-        inner = {}
-    filename = inner.get("filename") or part.get("filename") or "attachment.bin"
-    mime = inner.get("mime_type") or inner.get("file_type") or mime_from_name(filename)
-    data = None
-    inline_data = inner.get("data") or inner.get("file_data")
-    remote_url = inner.get("url") or inner.get("file_url")
-    if inline_data:
-        value = inline_data
-        if isinstance(value, str) and value.startswith("data:"):
-            data, mime, data_name = parse_data_url(value)
-            if not filename or filename == "attachment.bin":
-                filename = data_name
-        else:
-            data = base64.b64decode(value)
-    elif remote_url:
-        data, mime = await _download_url(remote_url)
-    elif part.get("file_id"):
-        file_id = str(part["file_id"])
-        local = file_store.get(file_id)
-        if local:
-            meta, data = local
-            filename = meta.get("filename") or filename
-            mime = meta.get("mime_type") or mime
-        else:
-            # Never forward an OpenAI file_id to grok as if it were a grok
-            # fileMetadataId: grok silently drops unknown ids and answers as
-            # if no attachment existed. Fail loudly instead.
-            raise GrokError(
-                f"unknown file_id {file_id!r}: upload it to /v1/files first",
-                code=400, kind="bad_file")
-    if data is None:
-        raise GrokError("file part requires file_data, file_url, or file_id", code=400, kind="bad_file")
-    if len(data) > MAX_ATTACHMENT_BYTES:
-        raise GrokError("attachment exceeds 20 MiB", code=400, kind="file_too_large")
-    meta = await upload_bytes(account, data, filename, mime)
-    return {"type": "input_file", "file_id": meta["fileMetadataId"], "filename": filename}
-
-
-async def _image_part(account: Account, part: dict) -> dict:
-    url = part.get("image_url")
-    if isinstance(url, dict):
-        url = url.get("url")
-    if not url:
-        raise GrokError("image_url requires a URL or data URL", code=400, kind="bad_image")
-    if url.startswith("data:"):
-        data, mime, filename = parse_data_url(url)
-    else:
-        data, mime = await _download_url(url)
-        filename = "image" + (mimetypes.guess_extension(mime) or ".bin")
-    meta = await upload_bytes(account, data, filename, mime)
-    return {"type": "input_file", "file_id": meta["fileMetadataId"], "filename": filename}
-
-
-async def _to_grok_content(account: Account, parts: list[dict]) -> list[dict]:
-    content = []
-    for part in parts:
-        ptype = part.get("type", "")
-        if ptype in ("text", "input_text"):
-            content.append({"type": "input_text", "text": part.get("text", "")})
-        elif ptype == "image_url":
-            content.append(await _image_part(account, part))
-        elif ptype in ("file", "input_file", "file_url"):
-            content.append(await _file_part(account, part))
-    return content or [{"type": "input_text", "text": ""}]
-
-
-# ---------------------------------------------------------------------------
-# Upstream orchestration
-# ---------------------------------------------------------------------------
-
-
-def _history_prefix(stored: list[dict], current: list[dict]) -> bool:
-    return len(current) >= len(stored) and stored == current[:len(stored)]
-
-
-def _prepend_text(item: dict, prefix: str) -> dict:
-    """Prefix text onto an item while keeping its non-text parts intact.
-
-    The context folds below build one combined text from the existing text
-    parts; replacing the parts list outright would silently drop any images
-    or files attached to the message.
-    """
-    kept = [p for p in item.get("parts", [])
-            if p.get("type") not in ("text", "input_text")]
-    return {**item, "parts": [{"type": "text", "text": prefix}] + kept}
-
-
-async def _replay(account: Account, turn: GrokTurn, history: list[dict]) -> tuple[list[str], dict | None]:
-    """Send history as separate items; fold assistant output into the next
-    user item because grok accepts user input items as context reliably."""
-    items = []
-    system = []
-    for item in history:
-        if item.get("role") == "system":
-            system.append(_item_text(item))
-        else:
-            items.append(item)
-    if system:
-        text = "[system]\n" + "\n\n".join(system) + "\n[/system]"
-        if items:
-            items[0] = _prepend_text(items[0], text + "\n\n" + _item_text(items[0]))
-        else:
-            items = [{"role": "user", "parts": [{"type": "text", "text": text}]}]
-    folded = []
-    pending = []
-    for item in items:
-        if item.get("role") == "assistant":
-            pending.append(_item_text(item))
-            continue
-        if pending and item.get("role") == "user":
-            context = "\n".join(f"[Previous assistant response: {text}]" for text in pending)
-            item = _prepend_text(item, context + "\n\n" + _item_text(item))
-            pending = []
-        folded.append(item)
-    if pending and folded:
-        folded[-1] = _prepend_text(
-            folded[-1],
-            _item_text(folded[-1]) + "\n\n[Previous assistant response: " + pending[-1] + "]")
-    file_ids: list[str] = []
-    response_item = None
-    last_index = len(folded) - 1
-    for index, item in enumerate(folded):
-        role = item.get("role", "user")
-        role = role if role in ("user", "assistant", "system") else "user"
-        content = await _to_grok_content(account, item.get("parts", []))
-        ids = [p["file_id"] for p in content if p.get("type") == "input_file" and p.get("file_id")]
-        file_ids.extend(ids)
-        # Grok's web client sends the final file-bearing user message as the
-        # `item` on response.create, not as conversation.item.create.
-        if ids and index == last_index and role == "user":
-            text_content = [p for p in content if p.get("type") != "input_file"]
-            response_item = {"type": "message", "role": "user",
-                             "content": text_content or [{"type": "input_text", "text": ""}]}
-            continue
-        await turn.add_item({"type": "message", "role": role, "content": content})
-    return file_ids, response_item
-
-
-# Upper bound on upstream attempts per request. The first attempt is one
-# account; after a failure, each round races RACE_ACCOUNTS sessions at once
-# so a request's wall time tracks the fastest working account instead of
-# the sum of every failing account's timeout.
-MAX_ATTEMPTS = 6
-RACE_ACCOUNTS = 4
-
-
-async def _race_attempts(client_key: str, model: str, history: list[dict], on_delta,
-                         accounts: list[Account]) -> tuple[tuple | None, Exception | None]:
-    """Run the turn on one of `accounts`, racing session setup.
-
-    Every account's connection + session.create run concurrently and the
-    first account whose session becomes ready carries the full turn (replay,
-    generate, streaming) — so when several accounts are failing, the request
-    pays only the fastest account's setup time. Accounts whose preflight
-    actually failed are reported to the pool (cooldown/health); accounts
-    that merely lost the race are closed quietly and stay healthy. Every
-    acquired slot is released exactly once, on every path (including outer
-    cancellation), so racing never leaks load or connections. Deterministic
-    client errors (GrokError 4xx) never penalize an account: they would fail
-    on any account identically.
-
-    Returns (result, None) on success or (None, error) on failure; any
-    genuinely failing account has already been reported to the pool.
-    """
-    async def preflight(acc: Account) -> tuple[Account, GrokTurn | None, BaseException | None]:
-        try:
-            return acc, await manager.new_turn(acc, model, None), None
-        except BaseException as exc:
-            return acc, None, exc
-
-    async def close_turn_bounded(turn: GrokTurn) -> None:
-        """Close a turn without letting an unresponsive peer stall teardown.
-
-        websockets' close() waits up to close_timeout for the peer's close
-        frame; a silent-but-connected gateway (the exact failing-account
-        case) would otherwise block each close for ~10s on the winner's
-        critical path. Cancellation always propagates — never swallow it.
-        """
-        try:
-            await asyncio.wait_for(manager.close_turn(turn), 1.5)
-        except asyncio.TimeoutError:
-            pass
+            await g.close()
         except Exception:
             pass
 
-    winner: tuple[Account, GrokTurn] | None = None
-    failures: list[tuple[Account, BaseException]] = []
-    released: set[int] = set()
-    closed_turns: set[int] = set()
 
-    def release_once(acc: Account) -> None:
-        if id(acc) not in released:
-            released.add(id(acc))
-            pool.release(acc)
-
-    async def close_turn_once(turn: GrokTurn) -> None:
-        if id(turn) not in closed_turns:
-            closed_turns.add(id(turn))
-            await close_turn_bounded(turn)
-
-    pending = {asyncio.create_task(preflight(a)): a for a in accounts}
-    winner_cleaned = False
-    try:
-        # Phase 1: race until a success settles or every preflight settles.
-        # asyncio.wait returns EVERY task that completed by the time it
-        # resumes, not just one — process the whole batch so no ready
-        # session, failed preflight, or slot is dropped.
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                acc, turn, exc = t.result()
-                if exc is not None:
-                    failures.append((acc, exc))
-                    continue
-                if winner is None:
-                    winner = (acc, turn)
-                else:
-                    # Another session became ready in the same wakeup — it
-                    # lost; discard it now so no connection or slot leaks.
-                    await close_turn_once(turn)
-                    release_once(acc)
-            if winner is not None:
-                break
-        # Phase 2: settle the remaining racers (cancelled or finished late).
-        for t in pending:
-            t.cancel()
-        loser_turns: list[GrokTurn] = []
-        for res in await asyncio.gather(*pending, return_exceptions=True):
-            if isinstance(res, BaseException):
-                continue
-            acc, turn, exc = res
-            if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                failures.append((acc, exc))
-            if turn is not None:
-                loser_turns.append(turn)
-            release_once(acc)
-        if loser_turns:
-            await asyncio.gather(*(close_turn_once(t) for t in loser_turns))
-        # Report genuine account failures; never penalize a deterministic
-        # client error (4xx) — it would fail on any account the same way.
-        for acc, exc in failures:
-            if isinstance(exc, GrokError) and 400 <= exc.code < 500:
-                continue
-            log.warning("preflight failed on account %s: %s", acc.index, str(exc)[:160])
-            pool.report_failure(acc, str(exc)[:160])
-            release_once(acc)
-        if winner is None:
-            real = [e for _, e in failures
-                    if not (isinstance(e, GrokError) and 400 <= e.code < 500)]
-            if not real:
-                raise GrokError("preflight race produced no result", kind="cancelled")
-            return None, real[-1]
-        acc, turn = winner
-        try:
-            file_ids, response_item = await _replay(acc, turn, history)
-            text, images, sources = await turn.generate(on_delta, file_attachment_ids=file_ids or None,
-                                                        item=response_item,
-                                                        user_text=_user_text(history))
-            store.create_session(client_key, acc.index, turn.session_id, turn.conversation_id, model, history)
-            pool.report_success(acc)
-            return (text, images, sources), None
-        except Exception as exc:
-            if not (isinstance(exc, GrokError) and 400 <= exc.code < 500):
-                log.warning("turn failed on account %s: %s", acc.index, str(exc)[:160])
-                pool.report_failure(acc, str(exc)[:160])
-            return None, exc
-        finally:
-            winner_cleaned = True
-            await close_turn_once(turn)
-            release_once(acc)
-    finally:
-        # Outer cancellation (or any exceptional exit): cancel stragglers,
-        # close the winner if the inner cleanup never ran, and release every
-        # slot. All helpers are idempotent, so this is exactly-once safe.
-        for t in pending:
-            t.cancel()
-        if pending:
-            for res in await asyncio.gather(*pending, return_exceptions=True):
-                if isinstance(res, BaseException):
-                    continue
-                acc2, turn2, exc2 = res
-                if turn2 is not None:
-                    await close_turn_once(turn2)
-                release_once(acc2)
-        if winner is not None and not winner_cleaned:
-            await close_turn_once(winner[1])
-            release_once(winner[0])
-        for acc in accounts:
-            release_once(acc)
+async def get_or_create_session(prefix_key: str | None, users: list[str],
+                                acc, mode: str = "fast") -> tuple[GrokSession, bool]:
+    """Return (session, continued). If prefix_key maps to a live session owned
+    by `acc`, reuse it (true multi-turn); otherwise create a fresh one with mode."""
+    async with SESSION_LOCK:
+        if prefix_key:
+            st = SESSIONS.get(prefix_key)
+            if st and st.account_key == acc.key and st.grok.alive():
+                st.touch()
+                return st.grok, True
+        sess = GrokSession(acc.cookie_header(), await _uid_for(acc), mode)
+        state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
+        if prefix_key:
+            SESSIONS[prefix_key] = state
+        return sess, False
 
 
-async def _run_turn(client_key: str, model: str, history: list[dict], on_delta) -> tuple[str, list[dict], list[dict]]:
-    """Run one chat turn. Returns (text, image parts, web sources).
+_uid_cache: dict[str, str] = {}
 
-    The first attempt is a single account (the pinned conversation account,
-    else the least-loaded account). On failure, later attempts race several
-    accounts' session setup concurrently so failing accounts never serialize
-    a request behind their timeouts.
-    """
-    last: Exception | None = None
-    for attempt in range(MAX_ATTEMPTS):
-        row = store.get_session(client_key)
-        accounts: list[Account] = []
-        if row and _history_prefix(row["history"], history):
-            pinned = next((a for a in pool.accounts()
-                           if a.index == row["account_index"] and a.healthy and not a.degraded), None)
-            if pinned is not None:
-                pinned.in_flight += 1
-                accounts = [pinned]
-        if not accounts:
-            # Rewind/edit (or the pinned account is gone): discard the pinned
-            # conversation and try fresh accounts.
-            row = None
-            n = 1 if attempt == 0 else RACE_ACCOUNTS
-            accounts = await pool.acquire_many(n)
-            if not accounts:
-                # Pool exhausted (every account cooling down): a capacity
-                # problem, not an upstream failure — always 503 so clients
-                # treat it as retryable, never 502.
-                raise GrokError("no healthy grok accounts available", code=503, kind="no_accounts")
-        result, error = await _race_attempts(client_key, model, history, on_delta, accounts)
-        if error is None:
-            return result
-        last = error
-        if isinstance(error, GrokError) and 400 <= error.code < 500:
-            # Client-caused and deterministic (bad file, bad image,
-            # oversized attachment): another account cannot succeed,
-            # and retrying would burn accounts on the same request.
-            raise error
-        store.delete_session(client_key)
-    raise GrokError(f"all accounts failed: {last}", code=502, kind="all_accounts_failed")
+async def _uid_for(acc) -> str:
+    if acc.user_id:
+        return acc.user_id
+    if acc.index not in _uid_cache:
+        _uid_cache[acc.index] = await gw.resolve_user_id(acc.cookie_header())
+        acc.user_id = _uid_cache[acc.index]
+    return _uid_cache[acc.index]
 
 
-# ---------------------------------------------------------------------------
-# Image output
-# ---------------------------------------------------------------------------
-# grok.com generates images on the dedicated imagine channel
-# (grok_imagine.py); the chat gateway is text-only. A chat request whose
-# last user message asks for an image is routed there, and every generated
-# image URL is re-hosted on PixelVault before it is returned to the client.
-
-IMAGE_VERB = r"(?:generate|create|draw|paint|render|produce|sketch|design|make)"
-IMAGE_NOUN = (r"(?:image|picture|pic|photo|photograph|illustration|drawing|painting|"
-              r"sketch|artwork|art|logo|wallpaper|poster|meme|avatar|portrait|graphic|"
-              r"icon|thumbnail|banner|comic|cartoon|manga|anime|cat|dog|animal|landscape|scene)")
-IMAGE_INTENT_RE = re.compile(rf"\b{IMAGE_VERB}\b[^\n.!?]{{0,80}}\b{IMAGE_NOUN}\b", re.IGNORECASE)
-# Text framing that must NOT route to the imagine channel: the user is
-# asking ABOUT images, not for one. Guards against burning image quota on
-# questions ("how do I generate an image description…") and software talk
-# ("create a test plan for the image upload feature").
-IMAGE_TEXT_RE = re.compile(
-    r"\b(?:how|why|what|which|when|where|explain|describe|summarize|summarise|"
-    r"summary|analysis|overview|recap|guide|list|tell me|compare|define)\b",
-    re.IGNORECASE)
-IMAGE_FEATURE_RE = re.compile(
-    r"\b(?:image|picture|photo|art|icon|thumbnail|banner|logo|graphic|drawing|painting)\b"
-    r"\s+(?:upload|processing|pipeline|feature|api|schema|documentation|docs|"
-    r"generation|tool|workflow|test|caption|description|alt|analysis)\b",
-    re.IGNORECASE)
+def user_texts(messages: list[dict]) -> list[str]:
+    return [m.get("content") if isinstance(m.get("content"), str)
+            else content_to_text(m.get("content"))
+            for m in messages if m.get("role") == "user"]
 
 
-def _user_text(items: list[dict]) -> str:
-    for item in reversed(items):
-        if item.get("role") in ("user", "developer"):
-            return _item_text(item)
-    return ""
+def rid_hint(users: list[str]) -> str:
+    return "resp:" + chain_key(users)
 
 
-def _image_intent(items: list[dict]) -> str | None:
-    text = _user_text(items)
-    if not text or not IMAGE_INTENT_RE.search(text):
-        return None
-    if IMAGE_TEXT_RE.search(text) or IMAGE_FEATURE_RE.search(text):
-        return None
-    return text
+def chain_key(users: list[str], auth_token: str = "") -> str:
+    payload = {"auth": auth_token, "users": users}
+    canon = json.dumps(payload, ensure_ascii=False)
+    return hashlib.sha256(canon.encode()).hexdigest()[:24]
 
 
-def _image_tail(text: str, urls: list[str]) -> str:
-    """Markdown link suffix appended to text so the URL is part of the output."""
-    if not urls:
-        return ""
-    links = "\n".join(f"![image]({u})" for u in urls)
-    return ("\n" if text else "") + links
-
-
-async def _host_images(images: list[dict]) -> list[str]:
-    """Upload Grok images to PixelVault; fall back to the original URL."""
-    urls = [img["url"] for img in images if img.get("url")]
-    if not urls:
-        return []
-    hosted = await asyncio.gather(*(pixelvault_url(u) for u in urls))
-    return [pv or orig for pv, orig in zip(hosted, urls)]
-
-
-async def _run_image_turn(prompt: str, n: int = 1, aspect: str = "1:1") -> list[dict]:
-    """Generate images via the imagine channel with cross-account retry."""
-    last: Exception | None = None
-    for _ in range(3):
-        account = await pool.acquire()
-        if account is None:
-            raise GrokError("no healthy grok accounts available", code=503, kind="no_accounts")
-        try:
-            imgs = await generate_images(account, prompt, n=n, aspect=aspect)
-            pool.report_success(account)
-            return imgs
-        except Exception as exc:
-            last = exc
-            pool.report_failure(account, str(exc)[:160])
-            if isinstance(exc, GrokError) and exc.kind in ("moderated", "imagine_error"):
-                # Prompt-level rejection: another account cannot succeed and
-                # a retry would burn another image generation.
-                raise
-        finally:
-            pool.release(account)
-    raise GrokError(f"image generation failed: {last}", code=502, kind="image_generation_failed")
-
-
-# ---------------------------------------------------------------------------
-# OpenAI response shaping
-# ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------- sources bridge
 
 SOURCE_APPENDIX_MAX = 50
 
 
 def _include_sources(flag: Any) -> bool:
-    """Per-request override; falls back to the GROK_INCLUDE_SOURCES env flag."""
+    """Per-request override; falls back to the G2O_INCLUDE_SOURCES config flag."""
     if flag is None:
         return INCLUDE_SOURCES
     if isinstance(flag, str):
@@ -759,6 +146,7 @@ def _include_sources(flag: Any) -> bool:
 
 
 def _host_of(url: str) -> str:
+    from urllib.parse import urlparse
     try:
         return (urlparse(url).netloc or "").lower()
     except ValueError:
@@ -768,29 +156,31 @@ def _host_of(url: str) -> str:
 def _source_appendix(sources: list, query: str) -> str:
     """Bridge source appendix for llmcord-go's "Show Sources" button.
 
-    Same contract as the perplexity-to-openai proxy's include_sources
-    appendix: the trailing \"Sources\" block (markdown links, first-seen
-    order, deduplicated upstream) plus a \"Search Queries\" footer keyed on
-    the client's latest user text. Emitted only when include_sources is
-    enabled, so non-llmcord clients never see it by default.
+    Matches the appendix contract parsed by llmcord-go across bridge providers:
+        \n\nSources
+        1. [Title](url) (domain) via `query`
+
+        Search Queries
+        1. `query`
     """
     entries: list[str] = []
-    # Collapse newlines/tabs so multi-line queries cannot break the
-    # backtick spans or the footer, then neutralize backticks themselves.
-    clean_query = " ".join(query.split()).replace("`", "'") if query else ""
+    seen_urls: set[str] = set()
+    clean_query = " ".join(query.split()).replace("`", "'").strip() if query else ""
     for src in sources[:SOURCE_APPENDIX_MAX]:
         if not isinstance(src, dict):
             continue
-        url = (src.get("url") or "").strip().replace("\n", "").replace("\r", "").replace("\t", "")
-        # llmcord-go's markdown-link regex stops at ')' and whitespace;
-        # escaping '(' too keeps the destination paren-free so
-        # balanced-paren parsers do not reject links like
-        # cc938592(v=technet.10).
-        url = url.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
-        if not url:
+        raw_url = src.get("url")
+        if not isinstance(raw_url, str) or not raw_url.strip():
             continue
+        url = raw_url.strip().replace("\n", "").replace("\r", "").replace("\t", "")
+        url = url.replace(")", "%29").replace(" ", "%20")
+        if not url or url.lower() in seen_urls:
+            continue
+        seen_urls.add(url.lower())
+
         title = " ".join(str(src.get("title") or "").split())
         title = title.replace("[", "").replace("]", "") or url
+
         entry = f"[{title}]({url})"
         host = _host_of(url)
         if title != url and host:
@@ -798,6 +188,7 @@ def _source_appendix(sources: list, query: str) -> str:
         if clean_query:
             entry += f" via `{clean_query}`"
         entries.append(entry)
+
     if not entries:
         return ""
     lines = ["Sources"]
@@ -809,368 +200,885 @@ def _source_appendix(sources: list, query: str) -> str:
     return "\n\n" + "\n".join(lines)
 
 
-def _usage(text: str) -> dict:
-    completion = max(1, len(text) // 4)
-    return {"prompt_tokens": 1, "completion_tokens": completion, "total_tokens": completion + 1}
+# ------------------------------------------------------------------- helpers
+
+def check_auth(request: Request) -> None:
+    if not API_KEY:
+        return
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {API_KEY}":
+        raise HTTPException(401, "invalid api key")
 
 
-def _responses_usage(text: str) -> dict:
-    # openai SDK >= 2 expects the Responses usage shape
-    output = max(1, len(text) // 4)
-    return {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-            "output_tokens": output, "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": output + 1}
+IMAGE_WORDS = re.compile(
+    r"\b(generate|create|draw|paint|render|make|imagine)\b[^.?!]{0,60}\b(image|picture|photo|drawing|art|illustration|logo|wallpaper|portrait|scene|cat|dog|animal)\b"
+    r"|\b(image|picture|photo|drawing|illustration)\s+of\b",
+    re.I,
+)
+
+TEXTUAL_MIMES_PREFIX = ("text/",)
+TEXTUAL_MIMES = {
+    "application/json", "application/javascript", "application/typescript",
+    "application/xml", "application/x-python", "application/x-sh",
+    "application/yaml", "application/toml", "application/sql",
+}
+TEXTUAL_EXT = re.compile(
+    r"\.(txt|md|markdown|json|jsonl|yaml|yml|toml|ini|cfg|conf|py|js|mjs|cjs|ts|tsx|jsx|"
+    r"java|kt|go|rs|rb|php|c|h|cpp|hpp|cs|swift|sh|bash|zsh|sql|html?|css|scss|xml|csv|tsv|log|env)$",
+    re.I,
+)
 
 
-def _chat_chunk(cid: str, model: str, created: int, delta: dict, finish=None) -> str:
-    return "data: " + json.dumps({
-        "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-    }) + "\n\n"
+async def refresh_statsig_pair() -> None:
+    async def fetch_page() -> str:
+        from curl_cffi.requests import AsyncSession
+        acc = pool.acquire()
+        cookie = acc.cookie_header() if acc else ""
+        async with AsyncSession(impersonate="chrome") as s:
+            # /index 404s; the seed/curves payload lives on the root page.
+            r = await s.get(f"{GROK_BASE}/",
+                            headers={"user-agent": USER_AGENT, "cookie": cookie},
+                            timeout=30)
+            return r.text
+    try:
+        await statsig.ensure_pair(fetch_page)
+    except Exception:
+        pass
 
 
-def _chat_object(cid: str, model: str, created: int, text: str, images: list[str] = ()) -> dict:
-    # content stays a plain string (markdown links): openai SDKs reject
-    # part arrays in chat.completion message content.
-    content = text + _image_tail(text, images)
-    return {"id": cid, "object": "chat.completion", "created": created, "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "usage": _usage(text)}
+def content_to_text(content: Any) -> str:
+    """Flatten OpenAI content (string or parts) to plain text for the prompt."""
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            t = p.get("type")
+            if t == "text" and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+    return "\n".join(parts)
 
 
-def _response_object(rid: str, model: str, created: int, text: str, status="completed",
-                     previous_response_id: str | None = None, images: list[str] = ()) -> dict:
-    # output parts are text-only (markdown links carry the image URLs):
-    # openai SDKs reject output_image parts in message content (union is
-    # output_text | output_refusal).
-    content: list[dict] = [{"type": "output_text", "text": text + _image_tail(text, images), "annotations": []}]
-    return {"id": rid, "object": "response", "created_at": created, "status": status,
-            "model": model, "error": None, "incomplete_details": None,
-            "instructions": None, "max_output_tokens": None, "parallel_tool_calls": True,
-            "previous_response_id": previous_response_id, "reasoning": {"effort": None, "summary": None},
-            "store": True, "temperature": None, "text": {"format": {"type": "text"}},
-            "tool_choice": "auto", "tools": [], "top_p": None, "truncation": "disabled",
-            "usage": _responses_usage(text), "user": None, "metadata": {},
-            "output": [{"id": new_id("msg_"), "type": "message", "role": "assistant", "status": "completed",
-                        "content": content, "logprobs": []}]}
+async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split message content parts into (prompt_messages, native_file_jobs).
+
+    Text-like files are inlined into the prompt text. Images and other binary
+    files are returned as jobs for native upload.
+    """
+    file_jobs: list[dict] = []   # {name, data, mime}
+    out: list[dict] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            out.append({**msg, "content": content})
+            continue
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        new_parts: list[str] = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            t = p.get("type")
+            if t == "text":
+                new_parts.append(p.get("text", ""))
+            elif t == "image_url":
+                url = (p.get("image_url") or {})
+                val = url.get("url") if isinstance(url, dict) else url
+                if isinstance(val, str):
+                    if val.startswith("data:"):
+                        try:
+                            data, mime, _ = decode_data_url(val)
+                            file_jobs.append({"name": p.get("name") or "image",
+                                              "data": data, "mime": mime})
+                        except UploadError:
+                            pass
+                    elif val.startswith("http"):
+                        try:
+                            from curl_cffi.requests import AsyncSession as AS
+                            async with AS(impersonate="chrome") as s:
+                                dr = await s.get(val, timeout=30)
+                                ct = dr.headers.get("content-type", "image/png").split(";")[0]
+                                file_jobs.append({"name": val.split("?")[0].split("/")[-1] or "image",
+                                                  "data": dr.content, "mime": ct})
+                        except Exception:
+                            pass
+                    else:
+                        # grok file id passed through
+                        file_jobs.append({"file_id": val})
+            elif t == "input_image":
+                url = p.get("image_url") or p.get("url")
+                if isinstance(url, str):
+                    if url.startswith("data:"):
+                        try:
+                            data, mime, _ = decode_data_url(url)
+                            file_jobs.append({"name": "image", "data": data, "mime": mime})
+                        except UploadError:
+                            pass
+                    elif url.startswith("http"):
+                        try:
+                            from curl_cffi.requests import AsyncSession as AS
+                            async with AS(impersonate="chrome") as s:
+                                dr = await s.get(url, timeout=30)
+                                ct = dr.headers.get("content-type", "image/png").split(";")[0]
+                                file_jobs.append({"name": "image", "data": dr.content, "mime": ct})
+                        except Exception:
+                            pass
+            elif t == "input_file" or t == "file":
+                fd = p.get("file") or {}
+                name = fd.get("filename") or p.get("filename") or "file"
+                mime = fd.get("mime_type") or p.get("mime_type")
+                if isinstance(fd.get("file_data"), str):
+                    val = fd["file_data"]
+                    if val.startswith("data:"):
+                        try:
+                            data, mime, _ = decode_data_url(val)
+                            file_jobs.append({"name": name, "data": data, "mime": mime})
+                        except UploadError:
+                            pass
+                elif isinstance(fd.get("file_id"), str):
+                    file_jobs.append({"file_id": fd["file_id"]})
+                elif isinstance(p.get("file_url"), str):
+                    try:
+                        from curl_cffi.requests import AsyncSession as AS
+                        async with AS(impersonate="chrome") as s:
+                            dr = await s.get(p["file_url"], timeout=30)
+                            file_jobs.append({"name": name, "data": dr.content,
+                                              "mime": mime or dr.headers.get("content-type", "").split(";")[0]})
+                    except Exception:
+                        pass
+        out.append({**msg, "content": "\n".join(x for x in new_parts)})
+    return out, file_jobs
 
 
-def _response_event(etype: str, seq: int, payload: dict) -> str:
-    return f"event: {etype}\ndata: {json.dumps({'type': etype, 'sequence_number': seq, **payload})}\n\n"
+def inline_textual(job: dict) -> str | None:
+    """Return fenced-inline text for textual files; None otherwise."""
+    mime = job.get("mime") or ""
+    name = job.get("name") or ""
+    if mime.startswith(TEXTUAL_MIMES_PREFIX) or mime in TEXTUAL_MIMES or TEXTUAL_EXT.search(name):
+        try:
+            text = job.get("data").decode("utf-8", errors="replace")
+            ext = re.sub(r"[^a-z0-9]", "", name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+            lang = ext if len(ext) <= 8 else ""
+            return f"```{lang} {name}\n{text}\n```"
+        except Exception:
+            return None
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Chat Completions API
-# ---------------------------------------------------------------------------
+MODEL_MODE_MAP = {
+    "grok-fast": "fast", "fast": "fast", "grok-4.5-fast": "fast",
+    "grok-auto": "auto", "auto": "auto",
+    "grok-expert": "expert", "expert": "expert",
+    "grok-heavy": "heavy", "heavy": "heavy",
+}
+
+
+def resolve_mode(model: str | None) -> tuple[str, str]:
+    """Returns (mode, public_model_name_for_response)."""
+    m = (model or DEFAULT_MODEL).strip().lower()
+    mode = MODEL_MODE_MAP.get(m)
+    if mode is None:
+        mode = "fast"
+    public = next((k for k, v in MODEL_MODE_MAP.items() if v == mode), m)
+    return mode, public
+
+
+def now_epoch() -> int:
+    return int(time.time())
+
+
+# -------------------------------------------------------------- image upload
+
+async def run_session_turn(sess: GrokSession, prompt: str, *,
+                           attachment_ids=None, system_prompt=None,
+                           file_jobs=None):
+    # Files are per-account on grok.com ("FileAttachment not found" on cross-account
+    # mentions), so upload with THIS session's account right before the turn.
+    if file_jobs:
+        try:
+            from curl_cffi.requests import AsyncSession as AS
+            await refresh_statsig_pair()
+            async with AS(impersonate="chrome") as s:
+                for job in file_jobs[:6]:
+                    if "file_id" in job:
+                        attachment_ids = (attachment_ids or []) + [job["file_id"]]
+                        continue
+                    fm = await upload_file(s, sess.cookie_header, statsig,
+                                           job.get("name") or "file",
+                                           job.get("data") or b"",
+                                           job.get("mime"))
+                    fid = fm.get("fileMetadataId")
+                    if fid:
+                        attachment_ids = (attachment_ids or []) + [fid]
+        except Exception as e:
+            import logging
+            logging.getLogger("uvicorn.error").warning(
+                "attachment upload failed: %s", e)
+            attachment_ids = None
+    events = []
+    async for ev in sess.ask(prompt, attachment_ids=attachment_ids,
+                             system_prompt=system_prompt, user_text=prompt):
+        events.append(ev)
+    done = next((e for e in events if e["type"] == "done"), None)
+    if not done:
+        raise GatewayError("upstream", "no result from gateway")
+    return done["result"], events
+
+
+
+
+async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
+    """Text-to-image via the Imagine WebSocket (wss://grok.com/ws/imagine/listen).
+    Rotates across accounts on rate limit. Returns list of public image URLs."""
+    import uuid as _uuid
+    import websockets
+
+    max_attempts = min(4, len(pool.snapshot()) or 1)
+    last_err = None
+
+    for attempt in range(max_attempts):
+        acc = pool.acquire()
+        if acc is None:
+            break
+        cookie = acc.cookie_header()
+        try:
+            uid = await gw.resolve_user_id(cookie)
+        except GatewayError:
+            pool.release_fail(acc, "auth")
+            continue
+
+        uri = "wss://grok.com/ws/imagine/listen"
+        ws_headers = {"Origin": GROK_BASE, "User-Agent": USER_AGENT,
+                      "Cookie": cookie + f"; x-userid={uid}"}
+        req_id = str(_uuid.uuid4())
+        msg = {
+            "type": "conversation.item.create",
+            "timestamp": int(time.time() * 1000),
+            "item": {"type": "message", "content": [{
+                "requestId": req_id,
+                "text": prompt,
+                "type": "input_text",
+                "properties": {
+                    "section_count": 0, "is_kids_mode": False,
+                    "enable_nsfw": True, "skip_upsampler": False,
+                    "enable_side_by_side": True, "is_initial": True,
+                    "aspect_ratio": "2:3", "enable_pro": False,
+                    "num_generations": num_images, "enable_watermark": False,
+                },
+            }]},
+        }
+        urls: list[str] = []
+        try:
+            async with websockets.connect(uri, additional_headers=ws_headers,
+                                          max_size=32 * 1024 * 1024) as ws:
+                await ws.send(json.dumps(msg))
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=180)
+                    pat = re.compile(r"https://imagine-public[^" + chr(34) + chr(92) + chr(92) + chr(92) + "s]+")
+                    for u in pat.findall(raw):
+                        if u not in urls:
+                            urls.append(u)
+                    env = json.loads(raw)
+                    etype = env.get("type", "")
+                    if etype == "error":
+                        err_code = env.get("err_code", "")
+                        if "rate_limit" in err_code:
+                            pool.release_fail(acc, "quota")
+                            last_err = f"account {acc.index} rate limited"
+                            break
+                        raise RuntimeError(f"imagine error: {env.get('err_msg', err_code)}")
+                    if etype == "image" and urls:
+                        # We have at least one image; wait briefly for more
+                        pass
+                    if etype == "response.done":
+                        break
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+            if urls:
+                pass  # got some images despite timeout
+            else:
+                pool.release_fail(acc, "generic")
+                last_err = f"account {acc.index}: WS timeout/closed"
+                continue
+        except RuntimeError:
+            raise
+        except Exception as e:
+            pool.release_fail(acc, "generic")
+            last_err = f"account {acc.index}: {e}"
+            continue
+
+        if urls:
+            pool.release_ok(acc)
+            # prefer jpg over png
+            jpg = [u for u in urls if u.endswith(".jpg")]
+            return jpg if jpg else urls
+
+    raise RuntimeError(f"all {max_attempts} attempts failed; last: {last_err}")
+
+
+
+
+def _asset_owner_cookie(url: str, fallback: str = "") -> str:
+    """Return the cookie belonging to the Grok user who owns an asset URL."""
+    match = re.search(r"https?://assets\.grok\.com/users/([^/]+)/", url)
+    if match:
+        owner = next((a for a in pool.snapshot() if a.user_id == match.group(1)), None)
+        if owner:
+            return owner.cookie_header()
+    return fallback
+
+
+async def _download_asset(url: str, cookie: str = "") -> tuple[bytes, str, str]:
+    """Fetch an image using the owning Grok account when required."""
+    if url.startswith("data:"):
+        data, mime, _ = decode_data_url(url)
+        return data, mime or "image/png", "image"
+    headers = {"user-agent": USER_AGENT}
+    if "assets.grok.com/users/" in url:
+        cookie = _asset_owner_cookie(url, cookie)
+    if cookie and "assets.grok.com" in url:
+        headers["cookie"] = cookie
+    name = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or "image"
+    from curl_cffi.requests import AsyncSession as AS
+    async with AS(impersonate="chrome") as s:
+        r = await s.get(url, headers=headers, timeout=60)
+    if r.status_code != 200 or not r.content:
+        raise UploadError(f"download {r.status_code}, {len(r.content)} bytes for {url[:80]}")
+    mime = (r.headers.get("content-type") or "").split(";")[0]
+    return r.content, mime, name
+
+
+async def host_images(urls: list[str], cookie: str = "") -> list[str]:
+    """Upload image bytes to public hosting and return only public URLs.
+
+    Grok assets are private to their owning account. Never hand an
+    ``assets.grok.com`` URL to the API client. If PixelVault is not configured
+    or hosting fails, log a warning and return available URLs or graceful fallback.
+    """
+    hosted: list[str] = []
+    for u in urls[:2]:
+        try:
+            asset_cookie = _asset_owner_cookie(u, cookie)
+            if "assets.grok.com/users/" in u:
+                data, mime, name = await _download_asset(u, asset_cookie)
+                info = await pixelvault_upload(data, name, guess_mime(name, mime))
+            else:
+                try:
+                    info = await pixelvault_upload_from_url(u)
+                except Exception:
+                    data, mime, name = await _download_asset(u, asset_cookie)
+                    info = await pixelvault_upload(data, name, guess_mime(name, mime))
+            public_url = info.get("url") if isinstance(info, dict) else None
+            if public_url:
+                hosted.append(public_url)
+        except Exception as e:
+            logging.getLogger("uvicorn.error").warning(
+                "image hosting failed for %s: %s", u[:120], e)
+    return hosted
+
+
+
+async def pick_account_and_turn(session_key: str | None, users: list[str], **kwargs):
+    """Pick an account; reuse its live grok session when continuing a chain."""
+    attempts = 0
+    mode = kwargs.get("mode") or "fast"
+    while True:
+        await pool.reload_if_changed()
+        continued = False
+        if session_key:
+            st = None
+            async with SESSION_LOCK:
+                st = SESSIONS.get(session_key)
+            if st and st.grok.alive():
+                acc = pool.acquire_by_key(st.account_key)
+                if acc:
+                    continued = True
+                    attempts += 1
+                    try:
+                        st.touch()
+                        result, events = await run_session_turn(
+                            st.grok, kwargs.get("prompt"),
+                            attachment_ids=kwargs.get("attachment_ids"),
+                            file_jobs=kwargs.get("file_jobs"),
+                            system_prompt=kwargs.get("system_prompt"))
+                        pool.release_ok(acc)
+                        return acc, result, events, st
+                    except GatewayError as e:
+                        pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
+                        await st.grok.close()
+                        async with SESSION_LOCK:
+                            SESSIONS.pop(session_key, None)
+        acc = pool.acquire()
+        if acc is None:
+            raise HTTPException(503, "no accounts available")
+        attempts += 1
+        try:
+            sess, _ = await get_or_create_session(None, users, acc, mode=mode)
+            result, events = await run_session_turn(
+                sess, kwargs.get("prompt"),
+                attachment_ids=kwargs.get("attachment_ids"),
+                file_jobs=kwargs.get("file_jobs"),
+                system_prompt=kwargs.get("system_prompt"))
+            pool.release_ok(acc)
+            state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
+            return acc, result, events, state
+        except GatewayError as e:
+            try:
+                await sess.close()
+            except Exception:
+                pass
+            kind = e.kind if e.kind in ("auth", "quota", "degraded") else "generic"
+            pool.release_fail(acc, kind)
+            if attempts >= max(3, min(len(pool.snapshot()) or 1, 5)) or not any(a.available() for a in pool.snapshot()):
+                status = 429 if e.kind == "quota" else 502
+                raise HTTPException(status, f"grok error ({e.kind}): {e}")
+
+
+# ---------------------------------------------------------------- chat route
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    await _check_auth(request)
-    body = await request.json()
-    model = normalize_model(body.get("model"))
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON payload")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+
+    stream = bool(body.get("stream"))
+    stream_options = body.get("stream_options") or {}
+    include_usage = bool(stream_options.get("include_usage")) if isinstance(stream_options, dict) else False
+    model_in = body.get("model")
+    if model_in is not None and not isinstance(model_in, str):
+        raise HTTPException(400, "model must be a string")
     raw_messages = body.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
-        raise GrokError("messages must be a non-empty array", code=400, kind="bad_request")
-    history = []
-    for message in raw_messages:
-        role = message.get("role", "user")
-        role = "system" if role == "developer" else role
-        history.append({"role": role, "parts": _chat_parts(message)})
-    key = _chat_key(model, history, body.get("user"))
-    cid = new_id("chatcmpl-")
-    created = int(time.time())
-    img_prompt = _image_intent(history)
-    async with _client_lock(key):
-        if body.get("stream"):
-            async def stream():
-                yield _chat_chunk(cid, model, created, {"role": "assistant", "content": ""})
-                if img_prompt is not None:
-                    try:
-                        urls = await _host_images(await _run_image_turn(img_prompt))
-                        yield _chat_chunk(cid, model, created, {"content": _image_tail("", urls)})
-                    except Exception as exc:
-                        yield "data: " + json.dumps({"error": _openai_error(exc)}) + "\n\n"
-                    yield _chat_chunk(cid, model, created, {}, "stop")
-                    yield "data: [DONE]\n\n"
-                    return
-                q: asyncio.Queue = asyncio.Queue(128)
-                done = asyncio.Event()
-                async def producer():
-                    try:
-                        async def delta(text, _event):
-                            await q.put(_chat_chunk(cid, model, created, {"content": text}))
-                        text, images, sources = await _run_turn(key, model, history, delta)
-                        urls = await _host_images(images)
-                        if urls:
-                            await q.put(_chat_chunk(cid, model, created,
-                                                    {"content": _image_tail(text, urls)}))
-                        if _include_sources(body.get("include_sources")):
-                            appendix = _source_appendix(sources, _user_text(history))
-                            if appendix:
-                                await q.put(_chat_chunk(cid, model, created,
-                                                        {"content": appendix}))
-                    except Exception as exc:
-                        await q.put("data: " + json.dumps({"error": _openai_error(exc)}) + "\n\n")
-                    finally:
-                        done.set()
-                task = asyncio.create_task(producer())
-                while not done.is_set() or not q.empty():
-                    try:
-                        yield await asyncio.wait_for(q.get(), 0.5)
-                    except asyncio.TimeoutError:
-                        pass
-                await task
-                yield _chat_chunk(cid, model, created, {}, "stop")
+        raise HTTPException(400, "messages array required")
+    messages: list[dict] = [m for m in raw_messages if isinstance(m, dict)]
+    if not messages:
+        raise HTTPException(400, "messages array must contain message objects")
+
+    await pool.reload_if_changed()
+    asyncio.create_task(refresh_statsig_pair())
+    await prune_sessions()
+
+    flat, file_jobs = await extract_attachments(messages)
+    mode, public_model = resolve_mode(model_in)
+
+    system_prompt = None
+    convo_msgs = []
+    for m in flat:
+        role = m.get("role")
+        c = m.get("content")
+        if role == "system" or (role == "developer" and isinstance(c, str)):
+            system_prompt = (system_prompt + "\n\n" + c) if system_prompt else c
+            continue
+        convo_msgs.append(m)
+
+    auth_header = request.headers.get("authorization", "")
+    users = user_texts(convo_msgs)
+    prefix_key = chain_key(users[:-1], auth_header) if len(users) >= 2 else None
+    prompt = users[-1] if users else ""
+
+    # inline textual attachments into prompt
+    inline_texts = []
+    remaining_jobs = []
+    for job in file_jobs:
+        if "file_id" in job:
+            remaining_jobs.append(job)
+            continue
+        inlined = inline_text_safe(job)
+        if inlined is not None:
+            inline_texts.append(inlined)
+        else:
+            remaining_jobs.append(job)
+    if inline_texts:
+        prompt = prompt + "\n\n" + "\n\n".join(inline_texts)
+
+    wants_image = bool(IMAGE_WORDS.search(prompt)) and "no image" not in prompt.lower()
+
+    if wants_image:
+        img_errs = []
+        asset_paths = None
+        for attempt in range(min(3, len(pool.snapshot()) or 1)):
+            try:
+                await refresh_statsig_pair()
+                asset_paths = await grok_generate_image(prompt)
+                break
+            except Exception as e:
+                img_errs.append(str(e)[:100])
+                import logging
+                logging.getLogger("uvicorn.error").warning(
+                    "image gen attempt %d/%d: %s", attempt+1, 3, e)
+        if asset_paths:
+            hosted = await host_images(asset_paths[:2])
+            content_md = "\n\n".join(f"![generated image]({u})" for u in hosted) or "Image generated."
+            rid = "chatcmpl-" + uuid.uuid4().hex[:24]
+            created = now_epoch()
+            if not stream:
+                return JSONResponse({
+                    "id": rid,
+                    "object": "chat.completion", "created": created,
+                    "model": public_model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": content_md, "refusal": None},
+                                 "finish_reason": "stop", "logprobs": None}],
+                    "usage": {"prompt_tokens": len(prompt) // 4, "completion_tokens": 0,
+                              "total_tokens": len(prompt) // 4},
+                })
+            async def img_sse():
+                first = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                         "model": public_model,
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
+                                      "finish_reason": None}]}
+                yield f"data: {json.dumps(first)}\n\n"
+                ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                      "model": public_model,
+                      "choices": [{"index": 0, "delta": {"content": content_md},
+                                   "finish_reason": None}]}
+                yield f"data: {json.dumps(ch)}\n\n"
+                end = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                       "model": public_model,
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(end)}\n\n"
+                if include_usage:
+                    usage_chunk = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                                   "model": public_model, "choices": [],
+                                   "usage": {"prompt_tokens": len(prompt) // 4, "completion_tokens": 0,
+                                             "total_tokens": len(prompt) // 4}}
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
-            return StreamingResponse(stream(), media_type="text/event-stream",
-                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-        full = []
-        async def delta(text, _event):
-            full.append(text)
-        if img_prompt is not None:
-            urls = await _host_images(await _run_image_turn(img_prompt))
-            return _chat_object(cid, model, created, "", urls)
-        text, images, sources = await _run_turn(key, model, history, delta)
-        urls = await _host_images(images)
-        resp = _chat_object(cid, model, created, "".join(full), urls)
-        if _include_sources(body.get("include_sources")):
-            appendix = _source_appendix(sources, _user_text(history))
+            return StreamingResponse(img_sse(), media_type="text/event-stream")
+        # all image gen attempts failed -> fall through to text chat
+        prompt = prompt.replace("[Generate an image] ", "")
+
+    acc, result, events, state = await pick_account_and_turn(
+        prefix_key, users[:], mode=mode, prompt=prompt,
+        file_jobs=remaining_jobs or None, system_prompt=system_prompt)
+
+    # persist so the NEXT incremental call (prefix == our full chain) reuses it
+
+    # persist so the NEXT incremental call (prefix == our full chain) reuses it
+    if users:
+        st = SessionState(account_key=acc.key, grok=state.grok, user_chain=list(users))
+        async with SESSION_LOCK:
+            SESSIONS[chain_key(users, auth_header)] = st
+            if len(users) >= 2:
+                SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
+
+    image_urls = list(result.image_urls)
+    if image_urls:
+        hosted = await host_images(image_urls, acc.cookie_header())
+        md = "\n\n".join(f"![generated image]({u})" for u in hosted)
+        result.text = (result.text + "\n\n" + md).strip()
+
+    rid = "chatcmpl-" + uuid.uuid4().hex[:24]
+    created = now_epoch()
+
+    finish_reason = result.finish_reason or "stop"
+
+    req_include_sources = _include_sources(body.get("include_sources"))
+    appendix = ""
+    if req_include_sources and result.sources:
+        appendix_query = result.search_queries[0] if result.search_queries else prompt
+        appendix = _source_appendix(result.sources, appendix_query)
+
+    final_response_text = result.text + appendix
+
+    usage_dict = {
+        "prompt_tokens": len(prompt) // 4,
+        "completion_tokens": len(final_response_text) // 4,
+        "total_tokens": (len(prompt) + len(final_response_text)) // 4,
+    }
+
+    if not stream:
+        return JSONResponse({
+            "id": rid, "object": "chat.completion", "created": created,
+            "model": public_model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": final_response_text, "refusal": None},
+                "finish_reason": finish_reason,
+                "logprobs": None,
+            }],
+            "usage": usage_dict,
+        })
+
+    async def sse():
+        try:
+            first = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                     "model": public_model,
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
+                                  "finish_reason": None}]}
+            yield f"data: {json.dumps(first)}\n\n"
+
+            for i in range(0, len(result.text), 80):
+                ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                      "model": public_model,
+                      "choices": [{"index": 0, "delta": {"content": result.text[i:i + 80]},
+                                   "finish_reason": None}]}
+                yield f"data: {json.dumps(ch)}\n\n"
             if appendix:
-                resp["choices"][0]["message"]["content"] += appendix
-        return resp
+                ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                      "model": public_model,
+                      "choices": [{"index": 0, "delta": {"content": appendix},
+                                   "finish_reason": None}]}
+                yield f"data: {json.dumps(ch)}\n\n"
+            end = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                   "model": public_model,
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
+            yield f"data: {json.dumps(end)}\n\n"
+            if include_usage:
+                usage_chunk = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                               "model": public_model, "choices": [],
+                               "usage": usage_dict}
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logging.getLogger("uvicorn.error").error("Chat SSE stream error: %s", e)
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
 
 
-# ---------------------------------------------------------------------------
-# Responses API
-# ---------------------------------------------------------------------------
+def iter_events(events):
+    yield from events
+
+
+def inline_text_safe(job: dict) -> str | None:
+    try:
+        return inline_textual(job)
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------- responses API
 
 @app.post("/v1/responses")
 async def responses_api(request: Request):
-    await _check_auth(request)
-    body = await request.json()
-    model = normalize_model(body.get("model"))
-    raw_new = await _responses_items(body.get("input", ""))
-    if body.get("instructions"):
-        raw_new.insert(0, {"role": "system", "parts": [{"type": "text", "text": body["instructions"]}]})
-    new_items = [{"role": x["role"], "parts": x["parts"]} for x in raw_new]
-    previous = body.get("previous_response_id")
-    key = _responses_key(model, new_items, body.get("user"), previous)
-    prior = store.get_session(key) if previous else None
-    history = list(prior.get("history", [])) if prior else []
-    history.extend(new_items)
-    rid = new_id("resp_")
-    created = int(time.time())
-    img_prompt = _image_intent(new_items)
-    async with _client_lock(key):
-        if body.get("stream"):
-            async def stream():
-                seq = 0
-                def event(etype, **payload):
-                    nonlocal seq
-                    seq += 1
-                    return _response_event(etype, seq, payload)
-                full = []
-                sources_out: list = []
-                q: asyncio.Queue = asyncio.Queue(128)
-                done = asyncio.Event()
-                msg_id = new_id("msg_")
-                images_out: list[dict] = []
-                async def producer():
-                    try:
-                        if img_prompt is not None:
-                            images_out.extend(await _run_image_turn(img_prompt))
-                            return
-                        async def delta(text, _event):
-                            full.append(text)
-                            await q.put(text)
-                        text, images, sources = await _run_turn(key, model, history, delta)
-                        images_out.extend(images)
-                        sources_out.extend(sources)
-                    except Exception as exc:
-                        await q.put({"error": _openai_error(exc)})
-                    finally:
-                        done.set()
-                yield event("response.created", response=_response_object(rid, model, created, "", "in_progress", previous))
-                yield event("response.in_progress")
-                yield event("response.output_item.added", output_index=0, item={"id": msg_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []})
-                yield event("response.content_part.added", item_id=msg_id, output_index=0, content_index=0, part={"type": "output_text", "text": "", "annotations": []})
-                task = asyncio.create_task(producer())
-                error = None
-                while not done.is_set() or not q.empty():
-                    try:
-                        item = await asyncio.wait_for(q.get(), 0.5)
-                    except asyncio.TimeoutError:
-                        continue
-                    if isinstance(item, dict) and "error" in item:
-                        error = item["error"]
-                        yield "event: error\ndata: " + json.dumps(error) + "\n\n"
-                        break
-                    yield event("response.output_text.delta", item_id=msg_id, output_index=0, content_index=0, delta=item, logprobs=[])
-                await task
-                if error:
-                    return
-                text = "".join(full)
-                urls = await _host_images(images_out)
-                display = text + _image_tail(text, urls)
-                appendix = ""
-                if _include_sources(body.get("include_sources")):
-                    appendix = _source_appendix(sources_out, _user_text(new_items))
-                wire = display + appendix
-                row = store.get_session(key)
-                if row:
-                    store.update_session(key, row.get("conversation_id"), history + [{"role": "assistant", "parts": [{"type": "text", "text": display}]}])
-                yield event("response.output_text.done", item_id=msg_id, output_index=0, content_index=0, text=wire, logprobs=[])
-                yield event("response.content_part.done", item_id=msg_id, output_index=0, content_index=0, part={"type": "output_text", "text": wire, "annotations": []})
-                yield event("response.output_item.done", output_index=0, item={"id": msg_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": wire, "annotations": []}]})
-                final = _response_object(rid, model, created, text, "completed", previous, urls)
-                if appendix:
-                    final["output"][0]["content"][0]["text"] = wire
-                yield event("response.completed", response=final)
-                store.register_response(rid, key)
-            return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-        full = []
-        sources: list = []
-        async def delta(text, _event):
-            full.append(text)
-        if img_prompt is not None:
-            images = await _run_image_turn(img_prompt)
-            text = ""
-        else:
-            text, images, sources = await _run_turn(key, model, history, delta)
-            text = "".join(full)
-        urls = await _host_images(images)
-        display = text + _image_tail(text, urls)
-        row = store.get_session(key)
-        if row:
-            store.update_session(key, row.get("conversation_id"), history + [{"role": "assistant", "parts": [{"type": "text", "text": display}]}])
-        store.register_response(rid, key)
-        resp = _response_object(rid, model, created, text, "completed", previous, urls)
-        if _include_sources(body.get("include_sources")):
-            appendix = _source_appendix(sources, _user_text(new_items))
-            if appendix:
-                resp["output"][0]["content"][0]["text"] = display + appendix
-        return resp
-
-
-# ---------------------------------------------------------------------------
-# Images API
-# ---------------------------------------------------------------------------
-
-@app.post("/v1/images/generations")
-async def images_generations(request: Request):
-    await _check_auth(request)
-    body = await request.json()
-    prompt = str(body.get("prompt") or "").strip()
-    if not prompt:
-        raise GrokError("prompt is required", code=400, kind="bad_request")
+    check_auth(request)
     try:
-        n = int(body.get("n") or 1)
-    except (TypeError, ValueError):
-        n = 1
-    n = max(1, min(n, 4))
-    imgs = await _run_image_turn(prompt, n=n,
-                                 aspect=aspect_ratio(body.get("size") or body.get("aspect_ratio")))
-    urls = await _host_images(imgs)
-    if not urls:
-        raise GrokError("no images were generated", code=502, kind="image_generation_failed")
-    return {"created": int(time.time()), "data": [{"url": u} for u in urls]}
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON payload")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+
+    stream = bool(body.get("stream"))
+    model_in = body.get("model")
+    if model_in is not None and not isinstance(model_in, str):
+        raise HTTPException(400, "model must be a string")
+    instructions = body.get("instructions") or ""
+    prev_resp_id = body.get("previous_response_id")
+    input_data = body.get("input")
+
+    await pool.reload_if_changed()
+    asyncio.create_task(refresh_statsig_pair())
+    await prune_sessions()
+
+    messages: list[dict] = []
+    if isinstance(input_data, str):
+        messages = [{"role": "user", "content": input_data}]
+    elif isinstance(input_data, list):
+        for item in input_data:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+            elif isinstance(item, dict):
+                itype = item.get("type")
+                role = item.get("role")
+                if itype == "message" or (role and not itype):
+                    messages.append({"role": role or "user", "content": item.get("content")})
+                elif itype == "input_text":
+                    messages.append({"role": "user", "content": item.get("text", "")})
+                elif itype in ("input_image", "input_file"):
+                    messages.append({"role": "user", "content": [item]})
+                elif role:
+                    messages.append(item)
+    auth_header = request.headers.get("authorization", "")
+    sess_prev = None
+    if prev_resp_id:
+        async with SESSION_LOCK:
+            sess_prev = SESSIONS.get(prev_resp_id)
+        if not messages:
+            if not sess_prev:
+                raise HTTPException(400, f"unknown previous_response_id: {prev_resp_id}")
+            raise HTTPException(400, "input required with previous_response_id")
+    if not messages:
+        raise HTTPException(400, "input required")
+
+    mode, public_model = resolve_mode(model_in)
+    users = user_texts(messages)
+    prefix_key = chain_key(users[:-1], auth_header) if len(users) >= 2 else None
+    if sess_prev is not None:
+        prefix_key = None
+
+    flat, file_jobs = await extract_attachments(messages)
+    prompt = ""
+    for m in reversed(flat):
+        if m.get("role") == "user":
+            c = m.get("content")
+            prompt = c if isinstance(c, str) else content_to_text(c)
+            break
+
+    inline_texts, remaining_jobs = [], []
+    for job in file_jobs:
+        if "file_id" in job:
+            remaining_jobs.append(job)
+            continue
+        inlined = inline_text_safe(job)
+        if inlined is not None:
+            inline_texts.append(inlined)
+        else:
+            remaining_jobs.append(job)
+    if inline_texts:
+        prompt = (prompt + "\n\n" + "\n\n".join(inline_texts)).strip()
+
+    # continue previous response's grok session when provided
+    if sess_prev is not None:
+        acc = pool.acquire_by_key(sess_prev.account_key)
+        if not acc:
+            raise HTTPException(409, "previous response account is cooling down; retry")
+        st = sess_prev
+        st.touch()
+        result, events = await run_session_turn(
+            st.grok, prompt, file_jobs=remaining_jobs or None,
+            system_prompt=instructions)
+        pool.release_ok(acc)
+        state = st
+    else:
+        acc, result, events, state = await pick_account_and_turn(
+            prefix_key, users[:], mode=mode, prompt=prompt,
+            file_jobs=remaining_jobs or None, system_prompt=instructions)
+
+    image_urls = list(result.image_urls)
+    if image_urls:
+        hosted = await host_images(image_urls, acc.cookie_header())
+        md = "\n\n".join(f"![generated image]({u})" for u in hosted)
+        result.text = (result.text + "\n\n" + md).strip()
+
+    rid = "resp_" + uuid.uuid4().hex
+    msg_id = "msg_" + uuid.uuid4().hex
+    created = now_epoch()
+
+    if users:
+        st = SessionState(account_key=acc.key, grok=state.grok, user_chain=list(users))
+        async with SESSION_LOCK:
+            SESSIONS[rid] = st                      # previous_response_id -> session
+            SESSIONS[rid + ":chain"] = st
+            if len(users) >= 2:
+                SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
+            SESSIONS[chain_key(users, auth_header)] = st
+
+    req_include_sources = _include_sources(body.get("include_sources"))
+    appendix = ""
+    if req_include_sources and result.sources:
+        appendix_query = result.search_queries[0] if result.search_queries else prompt
+        appendix = _source_appendix(result.sources, appendix_query)
+
+    final_response_text = result.text + appendix
+
+    output_item = {
+        "id": msg_id, "type": "message", "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": final_response_text, "annotations": []}],
+    }
+
+    usage_obj = {
+        "input_tokens": len(prompt) // 4,
+        "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+        "output_tokens": len(final_response_text) // 4,
+        "output_tokens_details": {"reasoning_tokens": len(result.reasoning) // 4},
+        "total_tokens": (len(prompt) + len(final_response_text)) // 4,
+    }
+
+    base_response = {
+        "id": rid, "object": "response", "created_at": created,
+        "completed_at": now_epoch(),
+        "status": "completed", "model": public_model,
+        "instructions": instructions or None,
+        "output": [output_item],
+        "output_text": final_response_text,
+        "error": None, "incomplete_details": None,
+        "previous_response_id": prev_resp_id or None,
+        "parallel_tool_calls": False,
+        "temperature": 1.0,
+        "tool_choice": "none",
+        "tools": [],
+        "top_p": 1.0,
+        "usage": usage_obj,
+        "metadata": {},
+    }
+
+    if not stream:
+        return JSONResponse(base_response)
+
+    async def sse():
+        seq = 0
+        def evt(name, data):
+            nonlocal seq
+            seq += 1
+            data["sequence_number"] = seq
+            return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+        resp_in_prog = dict(base_response, status="in_progress", completed_at=None, output=[])
+        yield evt("response.created", {"type": "response.created", "response": resp_in_prog})
+        yield evt("response.in_progress", {"type": "response.in_progress", "response": resp_in_prog})
+        yield evt("response.output_item.added", {
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {**output_item, "status": "in_progress", "content": []}})
+        yield evt("response.content_part.added", {
+            "type": "response.content_part.added", "item_id": msg_id,
+            "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}})
+
+        for i in range(0, len(result.text), 80):
+            yield evt("response.output_text.delta", {
+                "type": "response.output_text.delta", "item_id": msg_id,
+                "output_index": 0, "content_index": 0, "delta": result.text[i:i + 80]})
+        if appendix:
+            yield evt("response.output_text.delta", {
+                "type": "response.output_text.delta", "item_id": msg_id,
+                "output_index": 0, "content_index": 0, "delta": appendix})
+        yield evt("response.output_text.done", {
+            "type": "response.output_text.done", "item_id": msg_id,
+            "output_index": 0, "content_index": 0, "text": final_response_text})
+        yield evt("response.content_part.done", {
+            "type": "response.content_part.done", "item_id": msg_id,
+            "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": final_response_text, "annotations": []}})
+        yield evt("response.output_item.done", {
+            "type": "response.output_item.done", "output_index": 0, "item": output_item})
+        yield evt("response.completed", {"type": "response.completed",
+                                          "response": base_response})
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
 
 
-# ---------------------------------------------------------------------------
-# Files, models, health
-# ---------------------------------------------------------------------------
-
-@app.post("/v1/files")
-async def files_create(request: Request, file: UploadFile = File(...), purpose: str = Form("assistants")):
-    await _check_auth(request)
-    data = await file.read()
-    if len(data) > MAX_ATTACHMENT_BYTES:
-        raise GrokError("file exceeds 20 MiB", code=400, kind="file_too_large")
-    return file_store.create(data, file.filename or "upload.bin", file.content_type, purpose)
-
-
-@app.get("/v1/files")
-async def files_list(request: Request):
-    await _check_auth(request)
-    return {"object": "list", "data": file_store.list(), "has_more": False}
-
-
-@app.get("/v1/files/{file_id}")
-async def files_get(file_id: str, request: Request):
-    await _check_auth(request)
-    meta = file_store.metadata(file_id)
-    if meta is None:
-        return JSONResponse(status_code=404, content={"error": {"message": "file not found", "type": "invalid_request_error"}})
-    return meta
-
-
-@app.delete("/v1/files/{file_id}")
-async def files_delete(file_id: str, request: Request):
-    await _check_auth(request)
-    if not file_store.delete(file_id):
-        return JSONResponse(status_code=404, content={"error": {"message": "file not found", "type": "invalid_request_error"}})
-    return {"id": file_id, "object": "file", "deleted": True}
-
+# ------------------------------------------------------------------ misc routes
 
 @app.get("/v1/models")
-async def models():
-    ids = ["fast", "grok-3-mini-fast", "grok-4.5-fast", "grok-4.5", "expert"]
-    return {"object": "list", "data": [{"id": x, "object": "model", "created": 1700000000, "owned_by": "xai"} for x in ids]}
+async def models(request: Request):
+    check_auth(request)
+    data = [{"id": mid, "object": "model", "created": 1700000000, "owned_by": "grok"}
+            for mid in ["grok-fast", "grok-auto", "grok-expert", "grok-heavy"]]
+    return {"object": "list", "data": data}
 
 
 @app.get("/healthz")
 async def healthz():
-    accounts = pool.accounts()
-    return {"ok": True, "accounts": pool.count(),
-            "healthy_accounts": sum(a.healthy and not a.degraded for a in accounts),
-            "degraded_accounts": sum(a.degraded for a in accounts), "port": PORT}
-
-
-@app.get("/")
-async def root():
-    return {"service": "grok-to-openai", "docs": "/docs", "endpoints": ["/v1/chat/completions", "/v1/responses", "/v1/images/generations", "/v1/files", "/v1/models"]}
-
-
-# ---------------------------------------------------------------------------
-# Errors and entry point
-# ---------------------------------------------------------------------------
-
-
-def _openai_error(exc: Exception) -> dict:
-    if isinstance(exc, GrokError):
-        return {"message": exc.message, "type": exc.kind, "param": None, "code": exc.kind}
-    return {"message": str(exc), "type": "server_error", "param": None, "code": "server_error"}
-
-
-@app.exception_handler(GrokError)
-async def grok_error_handler(request: Request, exc: GrokError):
-    return JSONResponse(status_code=exc.code if 400 <= exc.code < 600 else 500, content={"error": _openai_error(exc)})
-
-
-@app.exception_handler(Exception)
-async def generic_error_handler(request: Request, exc: Exception):
-    log.exception("unhandled error")
-    return JSONResponse(status_code=500, content={"error": _openai_error(exc)})
-
-
-def _is_loopback(host: str) -> bool:
-    """True when binding `host` only exposes the machine to itself."""
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return host.strip().lower() in ("", "localhost")
+    await pool.reload_if_changed()
+    accounts = pool.snapshot()
+    return {
+        "ok": True,
+        "accounts": len(accounts),
+        "available": sum(1 for a in accounts if a.available()),
+        "statsig_ready": statsig.ready,
+        "sessions": len(SESSIONS),
+        "degraded_accounts": sum(1 for a in accounts if time.time() < a.degraded_until),
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
-    if not _is_loopback(HOST) and API_KEY is None:
-        # A non-loopback bind with authentication disabled exposes every
-        # endpoint — the whole grok account pool, attachment upload, and the
-        # local file store — to the network. Fail closed: set GROK_HOST to a
-        # loopback address, or set GROK_OPENAI_API_KEY to require bearer auth.
-        log.error(
-            "refusing to bind %s without GROK_OPENAI_API_KEY: the proxy would "
-            "be unauthenticated on the network (set GROK_OPENAI_API_KEY, or "
-            "bind GROK_HOST=127.0.0.1)", HOST)
-        raise SystemExit(1)
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="info")

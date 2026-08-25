@@ -1,16 +1,11 @@
-# Secrets — NEVER commit account cookies
-accounts.txt
+# Credentials — never commit
 .env
+accounts.txt
 
-# Runtime state and artifacts
-.venv/
-__pycache__/
-*.pyc
+# Runtime artifacts
 server.log
-server.pid
-grok_sessions.db
-grok_sessions.db-wal
-grok_sessions.db-shm
-.openai_files/
-.browser-profile/
-nohup.out
+.server.pid
+*.pyc
+__pycache__/
+node_modules/
+.signer/
