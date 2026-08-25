@@ -32,6 +32,64 @@ def strip_render_tags(text: str) -> str:
     """Remove grok:render pseudo-HTML card markup from streamed text."""
     return RENDER_TAG_RE.sub("", text)
 
+class RenderFilter:
+    """Incremental filter to strip <grok:render>...</grok:render> tags from streaming text deltas."""
+
+    def __init__(self) -> None:
+        self._buffer: str = ""
+        self._in_tag: bool = False
+
+    def process(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._buffer += chunk
+        out: list[str] = []
+        while self._buffer:
+            if not self._in_tag:
+                idx = self._buffer.find("<grok:render")
+                if idx == -1:
+                    # Check for potential partial prefix of "<grok:render" at the tail
+                    tag_start = "<grok:render"
+                    partial_len = 0
+                    for k in range(1, min(len(tag_start), len(self._buffer) + 1)):
+                        if tag_start.startswith(self._buffer[-k:]):
+                            partial_len = k
+                    if partial_len > 0:
+                        safe = self._buffer[:-partial_len]
+                        self._buffer = self._buffer[-partial_len:]
+                        if safe:
+                            out.append(safe)
+                        break
+                    else:
+                        out.append(self._buffer)
+                        self._buffer = ""
+                        break
+                else:
+                    if idx > 0:
+                        out.append(self._buffer[:idx])
+                        self._buffer = self._buffer[idx:]
+                    self._in_tag = True
+            else:
+                # In tag: look for closing tag </grok:render>
+                close_idx = self._buffer.find("</grok:render>")
+                if close_idx == -1:
+                    # We are still inside the tag, buffer everything inside
+                    break
+                else:
+                    # Skip past </grok:render>
+                    self._buffer = self._buffer[close_idx + len("</grok:render>"):]
+                    self._in_tag = False
+        return "".join(out)
+
+    def flush(self) -> str:
+        # At the end of turn, if we were not inside an actual render tag, flush remaining buffer
+        if not self._in_tag:
+            res = self._buffer
+            self._buffer = ""
+            return res
+        self._buffer = ""
+        return ""
+
 
 def _asset_url(u: str) -> str:
     if u.startswith(("data:", "http://", "https://")):

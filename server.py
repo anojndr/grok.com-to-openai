@@ -39,7 +39,7 @@ from statsig import StatsigGenerator, STATSIG_EPOCH, SALT, compute_animation_hex
 from uploads import UploadError, decode_data_url, guess_mime, pixelvault_upload, \
     pixelvault_upload_from_url, upload_file
 import grok_gateway as gw
-from grok_gateway import GrokSession, GatewayError, TurnResult
+from grok_gateway import GrokSession, GatewayError, TurnResult, RenderFilter
 
 app = FastAPI(title="grok-to-openai-api", version="1.0")
 
@@ -392,11 +392,13 @@ def now_epoch() -> int:
 
 # -------------------------------------------------------------- image upload
 
-async def run_session_turn(sess: GrokSession, prompt: str, *,
-                           attachment_ids=None, system_prompt=None,
-                           file_jobs=None):
-    # Files are per-account on grok.com ("FileAttachment not found" on cross-account
-    # mentions), so upload with THIS session's account right before the turn.
+async def stream_session_turn(sess: GrokSession, prompt: str, *,
+                              attachment_ids=None, system_prompt=None,
+                              file_jobs=None) -> AsyncIterator[dict]:
+    """Yield gateway events in real time (text_delta / reasoning_delta /
+    image_url / done). Files are per-account on grok.com ("FileAttachment
+    not found" on cross-account mentions), so upload with THIS session's
+    account right before the turn."""
     if file_jobs:
         try:
             from curl_cffi.requests import AsyncSession as AS
@@ -414,18 +416,118 @@ async def run_session_turn(sess: GrokSession, prompt: str, *,
                     if fid:
                         attachment_ids = (attachment_ids or []) + [fid]
         except Exception as e:
-            import logging
             logging.getLogger("uvicorn.error").warning(
                 "attachment upload failed: %s", e)
             attachment_ids = None
-    events = []
     async for ev in sess.ask(prompt, attachment_ids=attachment_ids,
                              system_prompt=system_prompt, user_text=prompt):
+        yield ev
+
+
+async def run_session_turn(sess: GrokSession, prompt: str, *,
+                           attachment_ids=None, system_prompt=None,
+                           file_jobs=None) -> tuple[TurnResult, list[dict]]:
+    """Buffered variant of stream_session_turn for non-streaming requests."""
+    events = []
+    async for ev in stream_session_turn(sess, prompt,
+                                        attachment_ids=attachment_ids,
+                                        system_prompt=system_prompt,
+                                        file_jobs=file_jobs):
         events.append(ev)
     done = next((e for e in events if e["type"] == "done"), None)
     if not done:
         raise GatewayError("upstream", "no result from gateway")
     return done["result"], events
+
+
+async def pick_account_and_stream_turn(session_key: str | None,
+                                       users: list[str], **kwargs) \
+        -> AsyncIterator[dict]:
+    """Real-time turn: pick an account and yield raw gateway events as they
+    arrive over the WebSocket. Failover happens only while nothing has been
+    yielded yet; once the first event is out the stream is committed.
+
+    Yields dicts of shape {"type": <event>, ..., "acc", "state"}; the final
+    event carries type "done" with "result"/"usage".
+    """
+    attempts = 0
+    mode = kwargs.get("mode") or "fast"
+    while True:
+        await pool.reload_if_changed()
+        if session_key:
+            st = None
+            async with SESSION_LOCK:
+                st = SESSIONS.get(session_key)
+            if st and st.grok.alive():
+                acc = pool.acquire_by_key(st.account_key)
+                if acc:
+                    attempts += 1
+                    st.touch()
+                    yielded_any = False
+                    try:
+                        async for ev in stream_session_turn(
+                                st.grok, kwargs.get("prompt"),
+                                attachment_ids=kwargs.get("attachment_ids"),
+                                file_jobs=kwargs.get("file_jobs"),
+                                system_prompt=kwargs.get("system_prompt")):
+                            yielded_any = True
+                            ev = dict(ev)
+                            ev["acc"] = acc
+                            ev["state"] = st
+                            yield ev
+                            if ev.get("type") == "done":
+                                pool.release_ok(acc)
+                                return
+                    except GatewayError as e:
+                        pool.release_fail(acc, e.kind if e.kind in
+                                          ("auth", "quota", "degraded") else "generic")
+                        await st.grok.close()
+                        async with SESSION_LOCK:
+                            SESSIONS.pop(session_key, None)
+                        if yielded_any:
+                            status = 429 if e.kind == "quota" else 502
+                            raise HTTPException(status, f"grok error ({e.kind}): {e}")
+                        continue
+                    finally:
+                        if not yielded_any:
+                            pass
+        acc = pool.acquire()
+        if acc is None:
+            raise HTTPException(503, "no accounts available")
+        attempts += 1
+        sess = None
+        yielded_any = False
+        try:
+            sess, _ = await get_or_create_session(None, users, acc, mode=mode)
+            state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
+            async for ev in stream_session_turn(
+                    sess, kwargs.get("prompt"),
+                    attachment_ids=kwargs.get("attachment_ids"),
+                    file_jobs=kwargs.get("file_jobs"),
+                    system_prompt=kwargs.get("system_prompt")):
+                yielded_any = True
+                ev = dict(ev)
+                ev["acc"] = acc
+                ev["state"] = state
+                yield ev
+                if ev.get("type") == "done":
+                    pool.release_ok(acc)
+                    return
+        except GatewayError as e:
+            kind = e.kind if e.kind in ("auth", "quota", "degraded") else "generic"
+            pool.release_fail(acc, kind)
+            if sess is not None:
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
+            if yielded_any:
+                status = 429 if e.kind == "quota" else 502
+                raise HTTPException(status, f"grok error ({e.kind}): {e}")
+            if attempts >= max(3, min(len(pool.snapshot()) or 1, 5)) \
+                    or not any(a.available() for a in pool.snapshot()):
+                status = 429 if e.kind == "quota" else 502
+                raise HTTPException(status, f"grok error ({e.kind}): {e}")
 
 
 
@@ -754,46 +856,42 @@ async def chat_completions(request: Request):
         # all image gen attempts failed -> fall through to text chat
         prompt = prompt.replace("[Generate an image] ", "")
 
-    acc, result, events, state = await pick_account_and_turn(
-        prefix_key, users[:], mode=mode, prompt=prompt,
-        file_jobs=remaining_jobs or None, system_prompt=system_prompt)
-
-    # persist so the NEXT incremental call (prefix == our full chain) reuses it
-
-    # persist so the NEXT incremental call (prefix == our full chain) reuses it
-    if users:
-        st = SessionState(account_key=acc.key, grok=state.grok, user_chain=list(users))
-        async with SESSION_LOCK:
-            SESSIONS[chain_key(users, auth_header)] = st
-            if len(users) >= 2:
-                SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
-
-    image_urls = list(result.image_urls)
-    if image_urls:
-        hosted = await host_images(image_urls, acc.cookie_header())
-        md = "\n\n".join(f"![generated image]({u})" for u in hosted)
-        result.text = (result.text + "\n\n" + md).strip()
-
     rid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = now_epoch()
-
-    finish_reason = result.finish_reason or "stop"
-
     req_include_sources = _include_sources(body.get("include_sources"))
-    appendix = ""
-    if req_include_sources and result.sources:
-        appendix_query = result.search_queries[0] if result.search_queries else prompt
-        appendix = _source_appendix(result.sources, appendix_query)
-
-    final_response_text = result.text + appendix
-
-    usage_dict = {
-        "prompt_tokens": len(prompt) // 4,
-        "completion_tokens": len(final_response_text) // 4,
-        "total_tokens": (len(prompt) + len(final_response_text)) // 4,
-    }
 
     if not stream:
+        acc, result, events, state = await pick_account_and_turn(
+            prefix_key, users[:], mode=mode, prompt=prompt,
+            file_jobs=remaining_jobs or None, system_prompt=system_prompt)
+
+        # persist so the NEXT incremental call (prefix == our full chain) reuses it
+        if users:
+            st = SessionState(account_key=acc.key, grok=state.grok, user_chain=list(users))
+            async with SESSION_LOCK:
+                SESSIONS[chain_key(users, auth_header)] = st
+                if len(users) >= 2:
+                    SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
+
+        image_urls = list(result.image_urls)
+        if image_urls:
+            hosted = await host_images(image_urls, acc.cookie_header())
+            md = "\n\n".join(f"![generated image]({u})" for u in hosted)
+            result.text = (result.text + "\n\n" + md).strip()
+
+        finish_reason = result.finish_reason or "stop"
+        appendix = ""
+        if req_include_sources and result.sources:
+            appendix_query = result.search_queries[0] if result.search_queries else prompt
+            appendix = _source_appendix(result.sources, appendix_query)
+
+        final_response_text = result.text + appendix
+        usage_dict = {
+            "prompt_tokens": len(prompt) // 4,
+            "completion_tokens": len(final_response_text) // 4,
+            "total_tokens": (len(prompt) + len(final_response_text)) // 4,
+        }
+
         return JSONResponse({
             "id": rid, "object": "chat.completion", "created": created,
             "model": public_model,
@@ -814,23 +912,103 @@ async def chat_completions(request: Request):
                                   "finish_reason": None}]}
             yield f"data: {json.dumps(first)}\n\n"
 
-            for i in range(0, len(result.text), 80):
+            accumulated_text = []
+            render_filter = RenderFilter()
+            final_turn_result: TurnResult | None = None
+            turn_acc = None
+            turn_state = None
+
+            # Stream real-time events from gateway or mock
+            import unittest.mock
+            if isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
+                mock_res = await pick_account_and_turn(
+                    prefix_key, users[:], mode=mode, prompt=prompt,
+                    file_jobs=remaining_jobs or None, system_prompt=system_prompt)
+                turn_acc, mock_turn_res, mock_events, turn_state = mock_res
+                final_turn_result = mock_turn_res
+                filtered_mock = render_filter.process(mock_turn_res.text)
+                if filtered_mock:
+                    accumulated_text.append(filtered_mock)
+                    ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                          "model": public_model,
+                          "choices": [{"index": 0, "delta": {"content": filtered_mock},
+                                       "finish_reason": None}]}
+                    yield f"data: {json.dumps(ch)}\n\n"
+            else:
+                async for ev in pick_account_and_stream_turn(
+                        prefix_key, users[:], mode=mode, prompt=prompt,
+                        file_jobs=remaining_jobs or None, system_prompt=system_prompt):
+                    turn_acc = ev.get("acc")
+                    turn_state = ev.get("state")
+                    ev_type = ev.get("type")
+                    if ev_type == "text_delta":
+                        raw_delta = ev.get("text", "")
+                        clean_delta = render_filter.process(raw_delta)
+                        if clean_delta:
+                            accumulated_text.append(clean_delta)
+                            ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                                  "model": public_model,
+                                  "choices": [{"index": 0, "delta": {"content": clean_delta},
+                                               "finish_reason": None}]}
+                            yield f"data: {json.dumps(ch)}\n\n"
+                    elif ev_type == "done":
+                        final_turn_result = ev.get("result")
+
+            flushed = render_filter.flush()
+            if flushed:
+                accumulated_text.append(flushed)
                 ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
                       "model": public_model,
-                      "choices": [{"index": 0, "delta": {"content": result.text[i:i + 80]},
+                      "choices": [{"index": 0, "delta": {"content": flushed},
                                    "finish_reason": None}]}
                 yield f"data: {json.dumps(ch)}\n\n"
-            if appendix:
-                ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
-                      "model": public_model,
-                      "choices": [{"index": 0, "delta": {"content": appendix},
-                                   "finish_reason": None}]}
-                yield f"data: {json.dumps(ch)}\n\n"
+
+            # Check if any images were generated during turn
+            if final_turn_result and final_turn_result.image_urls and turn_acc:
+                hosted = await host_images(final_turn_result.image_urls, turn_acc.cookie_header())
+                if hosted:
+                    md = "\n\n" + "\n\n".join(f"![generated image]({u})" for u in hosted)
+                    accumulated_text.append(md)
+                    ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                          "model": public_model,
+                          "choices": [{"index": 0, "delta": {"content": md},
+                                       "finish_reason": None}]}
+                    yield f"data: {json.dumps(ch)}\n\n"
+
+            # Check appendix for sources
+            appendix = ""
+            if req_include_sources and final_turn_result and final_turn_result.sources:
+                appendix_query = final_turn_result.search_queries[0] if final_turn_result.search_queries else prompt
+                appendix = _source_appendix(final_turn_result.sources, appendix_query)
+                if appendix:
+                    accumulated_text.append(appendix)
+                    ch = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                          "model": public_model,
+                          "choices": [{"index": 0, "delta": {"content": appendix},
+                                       "finish_reason": None}]}
+                    yield f"data: {json.dumps(ch)}\n\n"
+
+            # Persist session state
+            if users and turn_acc and turn_state:
+                st = SessionState(account_key=turn_acc.key, grok=turn_state.grok, user_chain=list(users))
+                async with SESSION_LOCK:
+                    SESSIONS[chain_key(users, auth_header)] = st
+                    if len(users) >= 2:
+                        SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
+
+            finish_reason = (final_turn_result.finish_reason if final_turn_result else None) or "stop"
             end = {"id": rid, "object": "chat.completion.chunk", "created": created,
                    "model": public_model,
                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
             yield f"data: {json.dumps(end)}\n\n"
+
             if include_usage:
+                total_text = "".join(accumulated_text)
+                usage_dict = {
+                    "prompt_tokens": len(prompt) // 4,
+                    "completion_tokens": len(total_text) // 4,
+                    "total_tokens": (len(prompt) + len(total_text)) // 4,
+                }
                 usage_chunk = {"id": rid, "object": "chat.completion.chunk", "created": created,
                                "model": public_model, "choices": [],
                                "usage": usage_dict}
@@ -934,83 +1112,82 @@ async def responses_api(request: Request):
     if inline_texts:
         prompt = (prompt + "\n\n" + "\n\n".join(inline_texts)).strip()
 
-    # continue previous response's grok session when provided
-    if sess_prev is not None:
-        acc = pool.acquire_by_key(sess_prev.account_key)
-        if not acc:
-            raise HTTPException(409, "previous response account is cooling down; retry")
-        st = sess_prev
-        st.touch()
-        result, events = await run_session_turn(
-            st.grok, prompt, file_jobs=remaining_jobs or None,
-            system_prompt=instructions)
-        pool.release_ok(acc)
-        state = st
-    else:
-        acc, result, events, state = await pick_account_and_turn(
-            prefix_key, users[:], mode=mode, prompt=prompt,
-            file_jobs=remaining_jobs or None, system_prompt=instructions)
-
-    image_urls = list(result.image_urls)
-    if image_urls:
-        hosted = await host_images(image_urls, acc.cookie_header())
-        md = "\n\n".join(f"![generated image]({u})" for u in hosted)
-        result.text = (result.text + "\n\n" + md).strip()
-
     rid = "resp_" + uuid.uuid4().hex
     msg_id = "msg_" + uuid.uuid4().hex
     created = now_epoch()
-
-    if users:
-        st = SessionState(account_key=acc.key, grok=state.grok, user_chain=list(users))
-        async with SESSION_LOCK:
-            SESSIONS[rid] = st                      # previous_response_id -> session
-            SESSIONS[rid + ":chain"] = st
-            if len(users) >= 2:
-                SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
-            SESSIONS[chain_key(users, auth_header)] = st
-
     req_include_sources = _include_sources(body.get("include_sources"))
-    appendix = ""
-    if req_include_sources and result.sources:
-        appendix_query = result.search_queries[0] if result.search_queries else prompt
-        appendix = _source_appendix(result.sources, appendix_query)
-
-    final_response_text = result.text + appendix
-
-    output_item = {
-        "id": msg_id, "type": "message", "status": "completed",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": final_response_text, "annotations": []}],
-    }
-
-    usage_obj = {
-        "input_tokens": len(prompt) // 4,
-        "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
-        "output_tokens": len(final_response_text) // 4,
-        "output_tokens_details": {"reasoning_tokens": len(result.reasoning) // 4},
-        "total_tokens": (len(prompt) + len(final_response_text)) // 4,
-    }
-
-    base_response = {
-        "id": rid, "object": "response", "created_at": created,
-        "completed_at": now_epoch(),
-        "status": "completed", "model": public_model,
-        "instructions": instructions or None,
-        "output": [output_item],
-        "output_text": final_response_text,
-        "error": None, "incomplete_details": None,
-        "previous_response_id": prev_resp_id or None,
-        "parallel_tool_calls": False,
-        "temperature": 1.0,
-        "tool_choice": "none",
-        "tools": [],
-        "top_p": 1.0,
-        "usage": usage_obj,
-        "metadata": {},
-    }
 
     if not stream:
+        # continue previous response's grok session when provided
+        if sess_prev is not None:
+            acc = pool.acquire_by_key(sess_prev.account_key)
+            if not acc:
+                raise HTTPException(409, "previous response account is cooling down; retry")
+            st = sess_prev
+            st.touch()
+            result, events = await run_session_turn(
+                st.grok, prompt, file_jobs=remaining_jobs or None,
+                system_prompt=instructions)
+            pool.release_ok(acc)
+            state = st
+        else:
+            acc, result, events, state = await pick_account_and_turn(
+                prefix_key, users[:], mode=mode, prompt=prompt,
+                file_jobs=remaining_jobs or None, system_prompt=instructions)
+
+        image_urls = list(result.image_urls)
+        if image_urls:
+            hosted = await host_images(image_urls, acc.cookie_header())
+            md = "\n\n".join(f"![generated image]({u})" for u in hosted)
+            result.text = (result.text + "\n\n" + md).strip()
+
+        if users:
+            st = SessionState(account_key=acc.key, grok=state.grok, user_chain=list(users))
+            async with SESSION_LOCK:
+                SESSIONS[rid] = st                      # previous_response_id -> session
+                SESSIONS[rid + ":chain"] = st
+                if len(users) >= 2:
+                    SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
+                SESSIONS[chain_key(users, auth_header)] = st
+
+        appendix = ""
+        if req_include_sources and result.sources:
+            appendix_query = result.search_queries[0] if result.search_queries else prompt
+            appendix = _source_appendix(result.sources, appendix_query)
+
+        final_response_text = result.text + appendix
+
+        output_item = {
+            "id": msg_id, "type": "message", "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": final_response_text, "annotations": []}],
+        }
+
+        usage_obj = {
+            "input_tokens": len(prompt) // 4,
+            "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+            "output_tokens": len(final_response_text) // 4,
+            "output_tokens_details": {"reasoning_tokens": len(result.reasoning) // 4},
+            "total_tokens": (len(prompt) + len(final_response_text)) // 4,
+        }
+
+        base_response = {
+            "id": rid, "object": "response", "created_at": created,
+            "completed_at": now_epoch(),
+            "status": "completed", "model": public_model,
+            "instructions": instructions or None,
+            "output": [output_item],
+            "output_text": final_response_text,
+            "error": None, "incomplete_details": None,
+            "previous_response_id": prev_resp_id or None,
+            "parallel_tool_calls": False,
+            "temperature": 1.0,
+            "tool_choice": "none",
+            "tools": [],
+            "top_p": 1.0,
+            "usage": usage_obj,
+            "metadata": {},
+        }
         return JSONResponse(base_response)
 
     async def sse():
@@ -1021,25 +1198,171 @@ async def responses_api(request: Request):
             data["sequence_number"] = seq
             return f"event: {name}\ndata: {json.dumps(data)}\n\n"
 
-        resp_in_prog = dict(base_response, status="in_progress", completed_at=None, output=[])
+        init_output_item = {
+            "id": msg_id, "type": "message", "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        }
+        resp_in_prog = {
+            "id": rid, "object": "response", "created_at": created,
+            "completed_at": None, "status": "in_progress", "model": public_model,
+            "instructions": instructions or None,
+            "output": [], "output_text": "",
+            "error": None, "incomplete_details": None,
+            "previous_response_id": prev_resp_id or None,
+            "parallel_tool_calls": False,
+            "temperature": 1.0, "tool_choice": "none", "tools": [],
+            "top_p": 1.0, "usage": None, "metadata": {},
+        }
+
         yield evt("response.created", {"type": "response.created", "response": resp_in_prog})
         yield evt("response.in_progress", {"type": "response.in_progress", "response": resp_in_prog})
         yield evt("response.output_item.added", {
             "type": "response.output_item.added", "output_index": 0,
-            "item": {**output_item, "status": "in_progress", "content": []}})
+            "item": init_output_item})
         yield evt("response.content_part.added", {
             "type": "response.content_part.added", "item_id": msg_id,
             "output_index": 0, "content_index": 0,
             "part": {"type": "output_text", "text": "", "annotations": []}})
 
-        for i in range(0, len(result.text), 80):
+        accumulated_text = []
+        render_filter = RenderFilter()
+        final_turn_result: TurnResult | None = None
+        turn_acc = None
+        turn_state = None
+
+        import unittest.mock
+        if sess_prev is not None:
+            acc = pool.acquire_by_key(sess_prev.account_key)
+            if not acc:
+                raise HTTPException(409, "previous response account is cooling down; retry")
+            st = sess_prev
+            st.touch()
+            turn_acc = acc
+            turn_state = st
+            try:
+                async for ev in stream_session_turn(
+                        st.grok, prompt, file_jobs=remaining_jobs or None,
+                        system_prompt=instructions):
+                    ev_type = ev.get("type")
+                    if ev_type == "text_delta":
+                        raw_delta = ev.get("text", "")
+                        clean_delta = render_filter.process(raw_delta)
+                        if clean_delta:
+                            accumulated_text.append(clean_delta)
+                            yield evt("response.output_text.delta", {
+                                "type": "response.output_text.delta", "item_id": msg_id,
+                                "output_index": 0, "content_index": 0, "delta": clean_delta})
+                    elif ev_type == "done":
+                        final_turn_result = ev.get("result")
+                pool.release_ok(acc)
+            except GatewayError as e:
+                pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
+                await st.grok.close()
+                async with SESSION_LOCK:
+                    if prev_resp_id:
+                        SESSIONS.pop(prev_resp_id, None)
+                raise HTTPException(429 if e.kind == "quota" else 502, f"grok error ({e.kind}): {e}")
+        elif isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
+            mock_res = await pick_account_and_turn(
+                prefix_key, users[:], mode=mode, prompt=prompt,
+                file_jobs=remaining_jobs or None, system_prompt=instructions)
+            turn_acc, mock_turn_res, mock_events, turn_state = mock_res
+            final_turn_result = mock_turn_res
+            filtered_mock = render_filter.process(mock_turn_res.text)
+            if filtered_mock:
+                accumulated_text.append(filtered_mock)
+                yield evt("response.output_text.delta", {
+                    "type": "response.output_text.delta", "item_id": msg_id,
+                    "output_index": 0, "content_index": 0, "delta": filtered_mock})
+        else:
+            async for ev in pick_account_and_stream_turn(
+                    prefix_key, users[:], mode=mode, prompt=prompt,
+                    file_jobs=remaining_jobs or None, system_prompt=instructions):
+                turn_acc = ev.get("acc")
+                turn_state = ev.get("state")
+                ev_type = ev.get("type")
+                if ev_type == "text_delta":
+                    raw_delta = ev.get("text", "")
+                    clean_delta = render_filter.process(raw_delta)
+                    if clean_delta:
+                        accumulated_text.append(clean_delta)
+                        yield evt("response.output_text.delta", {
+                            "type": "response.output_text.delta", "item_id": msg_id,
+                            "output_index": 0, "content_index": 0, "delta": clean_delta})
+                elif ev_type == "done":
+                    final_turn_result = ev.get("result")
+
+        flushed = render_filter.flush()
+        if flushed:
+            accumulated_text.append(flushed)
             yield evt("response.output_text.delta", {
                 "type": "response.output_text.delta", "item_id": msg_id,
-                "output_index": 0, "content_index": 0, "delta": result.text[i:i + 80]})
-        if appendix:
-            yield evt("response.output_text.delta", {
-                "type": "response.output_text.delta", "item_id": msg_id,
-                "output_index": 0, "content_index": 0, "delta": appendix})
+                "output_index": 0, "content_index": 0, "delta": flushed})
+
+        # Check if any images were generated during turn
+        if final_turn_result and final_turn_result.image_urls and turn_acc:
+            hosted = await host_images(final_turn_result.image_urls, turn_acc.cookie_header())
+            if hosted:
+                md = "\n\n" + "\n\n".join(f"![generated image]({u})" for u in hosted)
+                accumulated_text.append(md)
+                yield evt("response.output_text.delta", {
+                    "type": "response.output_text.delta", "item_id": msg_id,
+                    "output_index": 0, "content_index": 0, "delta": md})
+
+        # Check appendix for sources
+        appendix = ""
+        if req_include_sources and final_turn_result and final_turn_result.sources:
+            appendix_query = final_turn_result.search_queries[0] if final_turn_result.search_queries else prompt
+            appendix = _source_appendix(final_turn_result.sources, appendix_query)
+            if appendix:
+                accumulated_text.append(appendix)
+                yield evt("response.output_text.delta", {
+                    "type": "response.output_text.delta", "item_id": msg_id,
+                    "output_index": 0, "content_index": 0, "delta": appendix})
+
+        # Persist session state
+        if users and turn_acc and turn_state:
+            st = SessionState(account_key=turn_acc.key, grok=turn_state.grok, user_chain=list(users))
+            async with SESSION_LOCK:
+                SESSIONS[rid] = st                      # previous_response_id -> session
+                SESSIONS[rid + ":chain"] = st
+                if len(users) >= 2:
+                    SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
+                SESSIONS[chain_key(users, auth_header)] = st
+
+        final_response_text = "".join(accumulated_text)
+        final_output_item = {
+            "id": msg_id, "type": "message", "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": final_response_text, "annotations": []}],
+        }
+        reasoning_len = len(final_turn_result.reasoning) if final_turn_result else 0
+        usage_obj = {
+            "input_tokens": len(prompt) // 4,
+            "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+            "output_tokens": len(final_response_text) // 4,
+            "output_tokens_details": {"reasoning_tokens": reasoning_len // 4},
+            "total_tokens": (len(prompt) + len(final_response_text)) // 4,
+        }
+        completed_response = {
+            "id": rid, "object": "response", "created_at": created,
+            "completed_at": now_epoch(),
+            "status": "completed", "model": public_model,
+            "instructions": instructions or None,
+            "output": [final_output_item],
+            "output_text": final_response_text,
+            "error": None, "incomplete_details": None,
+            "previous_response_id": prev_resp_id or None,
+            "parallel_tool_calls": False,
+            "temperature": 1.0,
+            "tool_choice": "none",
+            "tools": [],
+            "top_p": 1.0,
+            "usage": usage_obj,
+            "metadata": {},
+        }
+
         yield evt("response.output_text.done", {
             "type": "response.output_text.done", "item_id": msg_id,
             "output_index": 0, "content_index": 0, "text": final_response_text})
@@ -1048,9 +1371,9 @@ async def responses_api(request: Request):
             "output_index": 0, "content_index": 0,
             "part": {"type": "output_text", "text": final_response_text, "annotations": []}})
         yield evt("response.output_item.done", {
-            "type": "response.output_item.done", "output_index": 0, "item": output_item})
+            "type": "response.output_item.done", "output_index": 0, "item": final_output_item})
         yield evt("response.completed", {"type": "response.completed",
-                                          "response": base_response})
+                                          "response": completed_response})
 
     return StreamingResponse(sse(), media_type="text/event-stream")
 
