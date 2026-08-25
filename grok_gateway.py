@@ -343,10 +343,14 @@ class GrokSession:
             self.ws = await websockets.connect(uri, additional_headers=headers,
                                                max_size=32 * 1024 * 1024,
                                                open_timeout=30, close_timeout=10)
+            xgrok = default_x_grok()
+            if self.conversation_id:
+                xgrok["conversation_id"] = self.conversation_id
             await self.ws.send(json.dumps({"event": {"type": "session.create",
                 "event_id": "evt_init_" + new_uuid(),
-                "session": {"model": self.model_mode, "x_grok": default_x_grok()}}}))
-            while not self.conversation_id:
+                "session": {"model": self.model_mode, "x_grok": xgrok}}}))
+            got_session_id = False
+            while not got_session_id:
                 raw = await asyncio.wait_for(self.ws.recv(), timeout=30)
                 try:
                     env = json.loads(raw)
@@ -354,7 +358,9 @@ class GrokSession:
                     raise GatewayError("upstream", f"malformed json in handshake: {e}")
                 ev = env.get("event") or {}
                 if ev.get("type") == "session.created":
-                    self.conversation_id = env.get("session_id") or ""
+                    if not self.conversation_id:
+                        self.conversation_id = env.get("session_id") or ""
+                    got_session_id = True
                 elif ev.get("type") == "error":
                     raise GatewayError("upstream", json.dumps(ev.get("error"))[:200])
         except Exception:

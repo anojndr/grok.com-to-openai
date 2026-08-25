@@ -6,6 +6,10 @@ accounts.txt
 server.log
 .server.pid
 *.pyc
+*.db
+*.db-shm
+*.db-wal
+data/
 __pycache__/
 node_modules/
 .signer/

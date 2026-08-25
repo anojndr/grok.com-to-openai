@@ -62,9 +62,10 @@ class Account:
 
 
 class AccountPool:
-    def __init__(self, path: str | Path, cooldown_seconds: int = 300):
+    def __init__(self, path: str | Path, cooldown_seconds: int = 300, store=None):
         self.path = Path(path)
         self.cooldown_seconds = cooldown_seconds
+        self.store = store
         self._accounts: list[Account] = []
         self._mtime: float = 0.0
         self._rr = itertools.count()
@@ -82,6 +83,7 @@ class AccountPool:
                 return
             new_accounts = self._parse(self.path)
             old_by_key = {a.key: a for a in self._accounts}
+            stored_states = self.store.get_all_account_states() if self.store else {}
             for acc in new_accounts:
                 old = old_by_key.get(acc.key)
                 if old is not None:
@@ -90,6 +92,12 @@ class AccountPool:
                     acc.in_flight = old.in_flight
                     acc.total_requests = old.total_requests
                     acc.failed_requests = old.failed_requests
+                elif acc.key in stored_states:
+                    st = stored_states[acc.key]
+                    acc.cooldown_until = st.get("cooldown_until", 0.0)
+                    acc.degraded_until = st.get("degraded_until", 0.0)
+                    acc.total_requests = st.get("total_requests", 0)
+                    acc.failed_requests = st.get("failed_requests", 0)
             self._accounts = new_accounts
             self._mtime = mtime
 
@@ -144,17 +152,32 @@ class AccountPool:
         idx = next(self._rr) % len(accounts)
         acc = accounts[idx]
         acc.total_requests += 1
+        if self.store:
+            self.store.save_account_state(
+                acc.key, acc.cooldown_until, acc.degraded_until,
+                acc.total_requests, acc.failed_requests,
+            )
         return acc
 
     def acquire_by_key(self, key: str) -> Account | None:
         acc = next((a for a in self._accounts if a.key == key), None)
         if acc and acc.available():
             acc.total_requests += 1
+            if self.store:
+                self.store.save_account_state(
+                    acc.key, acc.cooldown_until, acc.degraded_until,
+                    acc.total_requests, acc.failed_requests,
+                )
             return acc
         return None
 
     def release_ok(self, acc: Account) -> None:
         acc.cooldown_until = 0.0
+        if self.store:
+            self.store.save_account_state(
+                acc.key, acc.cooldown_until, acc.degraded_until,
+                acc.total_requests, acc.failed_requests,
+            )
 
     def release_fail(self, acc: Account, kind: str = "generic") -> None:
         cooldown = self.cooldown_seconds
@@ -173,3 +196,8 @@ class AccountPool:
             cooldown = max(cooldown, 3600)
             acc.degraded_until = max(acc.degraded_until, time.time() + cooldown)
         acc.mark_failed(cooldown)
+        if self.store:
+            self.store.save_account_state(
+                acc.key, acc.cooldown_until, acc.degraded_until,
+                acc.total_requests, acc.failed_requests,
+            )

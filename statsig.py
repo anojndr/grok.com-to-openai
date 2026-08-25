@@ -258,12 +258,24 @@ def extract_curves(html: str) -> list | None:
 # ------------------------------------------------------------------ generator
 
 class StatsigGenerator:
-    def __init__(self):
+    def __init__(self, store=None):
         self._seed_b64: str | None = None
         self._seed_bytes: bytes | None = None
         self._hex: str | None = None
         self._fetched_at = 0.0
         self._lock = asyncio.Lock()
+        self.store = store
+        if self.store:
+            cached = self.store.get_statsig()
+            if cached:
+                s_b64, h_str, f_at = cached
+                self._seed_b64 = s_b64
+                try:
+                    self._seed_bytes = base64.b64decode(s_b64 + "==")
+                except Exception:
+                    self._seed_bytes = None
+                self._hex = h_str
+                self._fetched_at = f_at
 
     async def ensure_pair(self, fetch_page) -> tuple[str, str]:
         """fetch_page: async callable () -> html text of grok.com/index."""
@@ -285,6 +297,8 @@ class StatsigGenerator:
                         self._seed_bytes = seed
                         self._hex = computed_hex
                         self._fetched_at = time.time()
+                        if self.store:
+                            self.store.set_statsig(seed_b64, computed_hex, self._fetched_at)
             except Exception:
                 pass
             return self._seed_b64, self._hex
@@ -297,6 +311,8 @@ class StatsigGenerator:
             self._seed_bytes = None
         self._hex = hex_str
         self._fetched_at = time.time()
+        if self.store:
+            self.store.set_statsig(seed_b64, hex_str, self._fetched_at)
 
     @property
     def ready(self) -> bool:
