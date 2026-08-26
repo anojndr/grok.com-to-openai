@@ -7,9 +7,8 @@ Endpoints:
   GET  /healthz
 
 Chat runs over Grok's WebSocket Gateway (fast path, no browser). Multi-turn
-conversations are real grok conversations: incremental requests reuse the
-existing gateway session (conversation attach + parent_response_id), sending
-only the newest user message.
+conversations attach each new request to an immutable user-chain checkpoint
+(conversation attach + parent_response_id), sending only the newest user message.
 """
 from __future__ import annotations
 
@@ -64,6 +63,41 @@ class SessionState:
 
 
 SESSIONS: dict[str, SessionState] = {}
+
+
+def _clone_session_state(state: SessionState, mode: str | None = None) -> SessionState:
+    source = state.grok
+    if isinstance(source, GrokSession):
+        sess = source.clone_checkpoint(mode)
+    else:
+        source_mode = getattr(source, "model_mode", "fast")
+        if not isinstance(source_mode, str):
+            source_mode = "fast"
+        cookie_header = getattr(source, "cookie_header", "")
+        user_id = getattr(source, "user_id", "")
+        sess = GrokSession(cookie_header, user_id, mode or source_mode)
+        sess.conversation_id = getattr(source, "conversation_id", "")
+        sess.last_parent_response_id = getattr(source, "last_parent_response_id", "")
+    return SessionState(
+        account_key=state.account_key,
+        grok=sess,
+        user_chain=list(state.user_chain),
+        created_at=state.created_at,
+        last_used=time.time(),
+    )
+
+
+async def fork_session_state(state: SessionState, mode: str | None = None) -> SessionState:
+    """Snapshot a checkpoint before advancing a conversation branch."""
+    source = state.grok
+    if isinstance(source, GrokSession):
+        async with source.lock:
+            fork = _clone_session_state(state, mode)
+            await source.close()
+            return fork
+    return _clone_session_state(state, mode)
+
+
 SESSION_LOCK = asyncio.Lock()
 
 
@@ -93,16 +127,16 @@ async def prune_sessions() -> None:
 
 async def get_or_create_session(prefix_key: str | None, users: list[str],
                                 acc, mode: str = "fast") -> tuple[GrokSession, bool]:
-    """Return (session, continued). If prefix_key maps to a live session owned
-    by `acc`, reuse it (true multi-turn); otherwise create a fresh one with mode."""
+    """Return a disconnected session forked from the requested chain checkpoint."""
     uid = await _uid_for(acc)
     async with SESSION_LOCK:
         if prefix_key:
             st = SESSIONS.get(prefix_key)
-            if st and st.account_key == acc.key and st.grok.alive():
-                st.touch()
-                store.touch_session(prefix_key, st.last_used)
-                return st.grok, True
+            if st and st.account_key == acc.key and (st.grok.alive() or st.grok.conversation_id):
+                fork = await fork_session_state(st, mode)
+                fork.touch()
+                store.touch_session(prefix_key, fork.last_used)
+                return fork.grok, True
             # Try restoring from persistent sqlite store
             if not st:
                 persisted = store.get_session(prefix_key)
@@ -119,7 +153,8 @@ async def get_or_create_session(prefix_key: str | None, users: list[str],
                     )
                     SESSIONS[prefix_key] = st
                     store.touch_session(prefix_key, st.last_used)
-                    return sess, True
+                    fork = await fork_session_state(st, mode)
+                    return fork.grok, True
         sess = GrokSession(acc.cookie_header(), uid, mode)
         state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
         if prefix_key:
@@ -553,6 +588,7 @@ async def pick_account_and_stream_turn(session_key: str | None,
                 acc = pool.acquire_by_key(st.account_key)
                 if acc:
                     attempts += 1
+                    st = await fork_session_state(st, mode)
                     st.touch()
                     store.touch_session(session_key, st.last_used)
                     yielded_any = False
@@ -569,24 +605,11 @@ async def pick_account_and_stream_turn(session_key: str | None,
                             yield ev
                             if ev.get("type") == "done":
                                 pool.release_ok(acc)
-                                store.save_session(
-                                    session_key=session_key,
-                                    account_key=acc.key,
-                                    user_chain=st.user_chain,
-                                    conversation_id=st.grok.conversation_id,
-                                    last_parent_response_id=st.grok.last_parent_response_id,
-                                    model_mode=mode,
-                                    created_at=st.created_at,
-                                    last_used=st.last_used,
-                                )
                                 return
                     except GatewayError as e:
                         pool.release_fail(acc, e.kind if e.kind in
                                           ("auth", "quota", "degraded") else "generic")
                         await st.grok.close()
-                        async with SESSION_LOCK:
-                            SESSIONS.pop(session_key, None)
-                            store.delete_session(session_key)
                         if yielded_any:
                             status = 429 if e.kind == "quota" else 502
                             raise HTTPException(status, f"grok error ({e.kind}): {e}")
@@ -819,6 +842,7 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                     continued = True
                     attempts += 1
                     try:
+                        st = await fork_session_state(st, mode)
                         st.touch()
                         store.touch_session(session_key, st.last_used)
                         result, events = await run_session_turn(
@@ -827,23 +851,10 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                             file_jobs=kwargs.get("file_jobs"),
                             system_prompt=kwargs.get("system_prompt"))
                         pool.release_ok(acc)
-                        store.save_session(
-                            session_key=session_key,
-                            account_key=acc.key,
-                            user_chain=st.user_chain,
-                            conversation_id=st.grok.conversation_id,
-                            last_parent_response_id=st.grok.last_parent_response_id,
-                            model_mode=mode,
-                            created_at=st.created_at,
-                            last_used=st.last_used,
-                        )
                         return acc, result, events, st
                     except GatewayError as e:
                         pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                         await st.grok.close()
-                        async with SESSION_LOCK:
-                            SESSIONS.pop(session_key, None)
-                            store.delete_session(session_key)
         acc = pool.acquire()
         if acc is None:
             raise HTTPException(503, "no accounts available")
@@ -1001,8 +1012,6 @@ async def chat_completions(request: Request):
             st = SessionState(account_key=acc.key, grok=state.grok, user_chain=list(users))
             async with SESSION_LOCK:
                 SESSIONS[chain_key(users, auth_header)] = st
-                if len(users) >= 2:
-                    SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
             k_curr = chain_key(users, auth_header)
             store.save_session(
                 session_key=k_curr,
@@ -1014,18 +1023,6 @@ async def chat_completions(request: Request):
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
-            if len(users) >= 2:
-                k_prev = chain_key(users[:-1], auth_header)
-                store.save_session(
-                    session_key=k_prev,
-                    account_key=acc.key,
-                    user_chain=list(users),
-                    conversation_id=state.grok.conversation_id,
-                    last_parent_response_id=state.grok.last_parent_response_id,
-                    model_mode=mode,
-                    created_at=st.created_at,
-                    last_used=st.last_used,
-                )
 
         image_urls = list(result.image_urls)
         if image_urls:
@@ -1147,8 +1144,6 @@ async def chat_completions(request: Request):
                 st = SessionState(account_key=turn_acc.key, grok=turn_state.grok, user_chain=list(users))
                 async with SESSION_LOCK:
                     SESSIONS[chain_key(users, auth_header)] = st
-                    if len(users) >= 2:
-                        SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
                 k_curr = chain_key(users, auth_header)
                 store.save_session(
                     session_key=k_curr,
@@ -1160,18 +1155,6 @@ async def chat_completions(request: Request):
                     created_at=st.created_at,
                     last_used=st.last_used,
                 )
-                if len(users) >= 2:
-                    k_prev = chain_key(users[:-1], auth_header)
-                    store.save_session(
-                        session_key=k_prev,
-                        account_key=turn_acc.key,
-                        user_chain=list(users),
-                        conversation_id=turn_state.grok.conversation_id,
-                        last_parent_response_id=turn_state.grok.last_parent_response_id,
-                        model_mode=mode,
-                        created_at=st.created_at,
-                        last_used=st.last_used,
-                    )
 
             finish_reason = (final_turn_result.finish_reason if final_turn_result else None) or "stop"
             end = {"id": rid, "object": "chat.completion.chunk", "created": created,
@@ -1317,7 +1300,7 @@ async def responses_api(request: Request):
             acc = pool.acquire_by_key(sess_prev.account_key)
             if not acc:
                 raise HTTPException(409, "previous response account is cooling down; retry")
-            st = sess_prev
+            st = await fork_session_state(sess_prev, mode)
             st.touch()
             try:
                 result, events = await run_session_turn(
@@ -1328,10 +1311,6 @@ async def responses_api(request: Request):
             except GatewayError as e:
                 pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                 await st.grok.close()
-                async with SESSION_LOCK:
-                    if prev_resp_id:
-                        SESSIONS.pop(prev_resp_id, None)
-                        store.delete_session(prev_resp_id)
                 raise HTTPException(429 if e.kind == "quota" else 502, f"grok error ({e.kind}): {e}")
         else:
             acc, result, events, state = await pick_account_and_turn(
@@ -1350,8 +1329,6 @@ async def responses_api(request: Request):
             async with SESSION_LOCK:
                 SESSIONS[rid] = st                      # previous_response_id -> session
                 SESSIONS[rid + ":chain"] = st
-                if len(users) >= 2:
-                    SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
                 SESSIONS[chain_key(users, auth_header)] = st
             store.save_session(
                 session_key=rid,
@@ -1383,17 +1360,6 @@ async def responses_api(request: Request):
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
-            if len(users) >= 2:
-                store.save_session(
-                    session_key=chain_key(users[:-1], auth_header),
-                    account_key=acc.key,
-                    user_chain=full_user_chain,
-                    conversation_id=state.grok.conversation_id,
-                    last_parent_response_id=state.grok.last_parent_response_id,
-                    model_mode=mode,
-                    created_at=st.created_at,
-                    last_used=st.last_used,
-                )
 
         appendix = ""
         if req_include_sources and result.sources:
@@ -1492,7 +1458,7 @@ async def responses_api(request: Request):
                 _fail_turn(HTTPException(409, "previous response account is cooling down; retry"))
                 acc = None
             if acc is not None:
-                st = sess_prev
+                st = await fork_session_state(sess_prev, mode)
                 st.touch()
                 turn_acc = acc
                 turn_state = st
@@ -1515,9 +1481,6 @@ async def responses_api(request: Request):
                 except GatewayError as e:
                     pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                     await st.grok.close()
-                    async with SESSION_LOCK:
-                        if prev_resp_id:
-                            SESSIONS.pop(prev_resp_id, None)
                     _fail_turn(e)
         elif isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
             mock_res = await pick_account_and_turn(
@@ -1601,8 +1564,6 @@ async def responses_api(request: Request):
             async with SESSION_LOCK:
                 SESSIONS[rid] = st                      # previous_response_id -> session
                 SESSIONS[rid + ":chain"] = st
-                if len(users) >= 2:
-                    SESSIONS.setdefault(chain_key(users[:-1], auth_header), st)
                 SESSIONS[chain_key(users, auth_header)] = st
             store.save_session(
                 session_key=rid,
@@ -1634,17 +1595,6 @@ async def responses_api(request: Request):
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
-            if len(users) >= 2:
-                store.save_session(
-                    session_key=chain_key(users[:-1], auth_header),
-                    account_key=turn_acc.key,
-                    user_chain=full_user_chain,
-                    conversation_id=turn_state.grok.conversation_id,
-                    last_parent_response_id=turn_state.grok.last_parent_response_id,
-                    model_mode=mode,
-                    created_at=st.created_at,
-                    last_used=st.last_used,
-                )
 
         final_response_text = "".join(accumulated_text)
         final_output_item = {

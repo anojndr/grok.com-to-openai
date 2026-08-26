@@ -29,10 +29,10 @@ python3 server.py     # serves on port 45080
 ## Features
 
 ### Multi-turn Conversations
-Uses Grok's WebSocket Gateway (`wss://grok.com/ws/mgw/`) with persistent sessions.
-Follow-up messages reuse the same live gateway session — only the new user message
-is sent over the wire (not the entire conversation history). Session state is keyed
-on user-message chains so incremental calls automatically continue the right thread.
+Uses Grok's WebSocket Gateway (`wss://grok.com/ws/mgw/`) with persistent conversations.
+Each follow-up attaches only the newest user message to an immutable user-message-chain
+checkpoint, so replies to earlier messages start from the selected branch rather than
+inheriting a later sibling turn.
 
 ### File Support
 Attach images (data URLs, HTTP URLs), text files (inlined into prompt), and binary
@@ -152,6 +152,7 @@ curl http://localhost:45080/v1/chat/completions \
 ```
 server.py          FastAPI app, OpenAI-compatible endpoints
 accounts.py        Account pool manager (round-robin, cooldown, hot-reload)
+session_store.py   SQLite persistence for multi-turn sessions, accounts, and caches
 statsig.py         x-statsig-id generator (pure Python, no browser needed)
 grok_gateway.py    WebSocket Gateway client (chat sessions)
 uploads.py         File upload v2 + PixelVault integration

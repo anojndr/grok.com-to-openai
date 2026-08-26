@@ -335,6 +335,17 @@ class GrokSession:
         self.last_parent_response_id = ""
         self.lock = asyncio.Lock()
 
+    def clone_checkpoint(self, model_mode: str | None = None) -> "GrokSession":
+        """Create a disconnected session positioned at this conversation checkpoint."""
+        sess = GrokSession(
+            self.cookie_header,
+            self.user_id,
+            model_mode or self.model_mode,
+        )
+        sess.conversation_id = self.conversation_id
+        sess.last_parent_response_id = self.last_parent_response_id
+        return sess
+
     async def connect(self) -> None:
         uri = f"wss://grok.com/ws/mgw/?uid={self.user_id}"
         headers = {"Origin": GROK_BASE, "User-Agent": USER_AGENT,
