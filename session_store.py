@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     conversation_id         TEXT NOT NULL DEFAULT '',
     last_parent_response_id TEXT NOT NULL DEFAULT '',
     model_mode              TEXT NOT NULL DEFAULT 'fast',
+    attachments_json        TEXT NOT NULL DEFAULT '[]',
     created_at              REAL NOT NULL,
     last_used               REAL NOT NULL
 );
@@ -51,6 +52,23 @@ CREATE TABLE IF NOT EXISTS statsig_cache (
 );
 """
 
+# Remembered attachments kept per conversation row (oldest dropped). Shared
+# with server.stream_session_turn so every writer caps identically.
+MAX_TRACKED_ATTACHMENTS = 12
+
+
+def clean_attachment_rows(raw: Any) -> list[dict]:
+    """Canonicalize stored attachment rows: shape-checked, hash coerced, capped."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for e in raw:
+        if isinstance(e, dict) and isinstance(e.get("file_id"), str) and e["file_id"]:
+            h = e.get("hash")
+            out.append({"file_id": e["file_id"],
+                        "hash": h if isinstance(h, str) else None})
+    return out[-MAX_TRACKED_ATTACHMENTS:]
+
 
 class SqliteStore:
     def __init__(self, db_path: str | Path = "data/grok_store.db"):
@@ -67,6 +85,16 @@ class SqliteStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        # Databases created before attachments_json existed: add the column
+        # in place; existing rows fall back to the '[]' default. Probe the
+        # schema instead of blanket-catching OperationalError, so a locked or
+        # otherwise broken database surfaces here instead of failing later
+        # with a misleading "no such column".
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)")}
+        if "attachments_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'")
+            self._conn.commit()
 
     def _execute(self, sql: str, params=()) -> sqlite3.Cursor:
         with self._lock:
@@ -92,12 +120,18 @@ class SqliteStore:
             d["user_chain"] = json.loads(d.get("user_chain_json") or "[]")
         except Exception:
             d["user_chain"] = []
+        try:
+            raw = json.loads(d.get("attachments_json") or "[]")
+        except Exception:
+            raw = []
+        d["attachments"] = clean_attachment_rows(raw)
         return d
 
     def save_session(self, session_key: str, account_key: str, user_chain: list[str],
                      conversation_id: str = "", last_parent_response_id: str = "",
                      model_mode: str = "fast", created_at: float | None = None,
-                     last_used: float | None = None) -> None:
+                     last_used: float | None = None,
+                     attachments: list[dict] | None = None) -> None:
         now = time.time()
         created_at = float(created_at) if isinstance(created_at, (int, float)) else now
         last_used = float(last_used) if isinstance(last_used, (int, float)) else now
@@ -110,12 +144,28 @@ class SqliteStore:
             user_chain = list(user_chain) if hasattr(user_chain, "__iter__") and not isinstance(user_chain, (str, bytes)) else []
         clean_chain = [str(u) for u in user_chain if isinstance(u, str)]
         user_chain_json = json.dumps(clean_chain, ensure_ascii=False)
+        if attachments is None:
+            # Preserve the stored registry atomically: the scalar subquery
+            # reads the existing row's attachments_json inside the same
+            # INSERT, so a concurrent explicit-attachments save can never be
+            # clobbered by a stale read-modify-write.
+            self._execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(session_key, account_key, user_chain_json, conversation_id, last_parent_response_id, model_mode, attachments_json, created_at, last_used) "
+                "VALUES (?, ?, ?, ?, ?, ?, "
+                "COALESCE((SELECT attachments_json FROM sessions WHERE session_key = ?), '[]'), ?, ?)",
+                (session_key, account_key, user_chain_json, conversation_id,
+                 last_parent_response_id, model_mode, session_key,
+                 created_at, last_used),
+            )
+            return
+        attachments_json = json.dumps(clean_attachment_rows(attachments), ensure_ascii=False)
         self._execute(
             "INSERT OR REPLACE INTO sessions "
-            "(session_key, account_key, user_chain_json, conversation_id, last_parent_response_id, model_mode, created_at, last_used) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(session_key, account_key, user_chain_json, conversation_id, last_parent_response_id, model_mode, attachments_json, created_at, last_used) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_key, account_key, user_chain_json, conversation_id,
-             last_parent_response_id, model_mode, created_at, last_used),
+             last_parent_response_id, model_mode, attachments_json, created_at, last_used),
         )
 
     def touch_session(self, session_key: str, last_used: float | None = None) -> None:

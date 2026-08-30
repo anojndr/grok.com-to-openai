@@ -333,6 +333,15 @@ class GrokSession:
         self.ws = None
         self.conversation_id = ""
         self.last_parent_response_id = ""
+        # Uploaded attachments made visible on this conversation, oldest first:
+        # [{"file_id": <grok fileMetadataId>, "hash": <sha256 hex | None>}, ...].
+        # The gateway only "sees" files mentioned on the CURRENT message, so
+        # later turns re-mention these ids (see server.stream_session_turn).
+        self.attachments: list[dict] = []
+        # Ids stream_session_turn declared stale on the most recent turn
+        # (reset every turn); pick_account_and_* propagate them to the source
+        # checkpoint so failover does not re-mention dead files.
+        self.last_dropped_attachment_ids: set[str] = set()
         self.lock = asyncio.Lock()
 
     def clone_checkpoint(self, model_mode: str | None = None) -> "GrokSession":
@@ -344,6 +353,7 @@ class GrokSession:
         )
         sess.conversation_id = self.conversation_id
         sess.last_parent_response_id = self.last_parent_response_id
+        sess.attachments = [dict(a) for a in self.attachments]
         return sess
 
     async def connect(self) -> None:

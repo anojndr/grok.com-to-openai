@@ -34,6 +34,17 @@ Each follow-up attaches only the newest user message to an immutable user-messag
 checkpoint, so replies to earlier messages start from the selected branch rather than
 inheriting a later sibling turn.
 
+### Cross-turn Attachment Memory
+Grok's gateway only renders files mentioned on the CURRENT message, so a
+follow-up turn would otherwise lose sight of images attached in earlier turns
+("I can't see the images you attached"). Uploaded file ids are remembered per
+conversation (and in SQLite across restarts), re-mentioned on later turns (the
+6 most recent per turn, so current-request images always win), and deduplicated
+by content hash so replayed history reuses the original upload instead of
+re-uploading the same bytes. Remembered ids that grok rejects are dropped
+automatically (only when the turn fails before streaming), and image URLs that
+fail to download are logged instead of vanishing silently.
+
 ### File Support
 Attach images (data URLs, HTTP URLs), text files (inlined into prompt), and binary
 files (uploaded via Grok's presigned upload pipeline). Supported input types:

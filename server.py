@@ -33,7 +33,7 @@ from config import API_KEY, COOLDOWN_SECONDS, DEFAULT_MODEL, GROK_BASE, PORT, \
     SESSION_TTL, MAX_SESSIONS, USER_AGENT, INCLUDE_SOURCES
 from accounts import AccountPool
 from statsig import StatsigGenerator, STATSIG_EPOCH, SALT, compute_animation_hex, curves_to_path
-from session_store import SqliteStore
+from session_store import SqliteStore, MAX_TRACKED_ATTACHMENTS, clean_attachment_rows
 
 
 from uploads import UploadError, decode_data_url, guess_mime, pixelvault_upload, \
@@ -78,6 +78,7 @@ def _clone_session_state(state: SessionState, mode: str | None = None) -> Sessio
         sess = GrokSession(cookie_header, user_id, mode or source_mode)
         sess.conversation_id = getattr(source, "conversation_id", "")
         sess.last_parent_response_id = getattr(source, "last_parent_response_id", "")
+        sess.attachments = _clean_attachment_registry(getattr(source, "attachments", None))
     return SessionState(
         account_key=state.account_key,
         grok=sess,
@@ -144,6 +145,8 @@ async def get_or_create_session(prefix_key: str | None, users: list[str],
                     sess = GrokSession(acc.cookie_header(), uid, mode)
                     sess.conversation_id = persisted.get("conversation_id", "")
                     sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+                    sess.attachments = _clean_attachment_registry(
+                        persisted.get("attachments"))
                     st = SessionState(
                         account_key=acc.key,
                         grok=sess,
@@ -166,6 +169,7 @@ async def get_or_create_session(prefix_key: str | None, users: list[str],
                 conversation_id=sess.conversation_id,
                 last_parent_response_id=sess.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(sess),
                 created_at=state.created_at,
                 last_used=state.last_used,
             )
@@ -290,6 +294,14 @@ IMAGE_WORDS = re.compile(
     re.I,
 )
 
+# Cross-turn attachment memory (see stream_session_turn): grok's gateway only
+# renders files mentioned on the CURRENT message, so follow-up turns re-mention
+# ids remembered on the session and dedupe replayed bytes by content hash.
+# MAX_TRACKED_ATTACHMENTS lives in session_store (shared cap for all writers).
+MAX_TURN_MENTIONS = 6          # mentioned per turn (matches file_jobs[:6])
+ATTACHMENT_ERROR_WORDS = ("fileattachment", "file attachment",
+                          "file_mention", "attachment")
+
 TEXTUAL_MIMES_PREFIX = ("text/",)
 TEXTUAL_MIMES = {
     "application/json", "application/javascript", "application/typescript",
@@ -381,8 +393,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                             data, mime, _ = decode_data_url(val)
                             file_jobs.append({"name": p.get("name") or "image",
                                               "data": data, "mime": mime})
-                        except UploadError:
-                            pass
+                        except UploadError as e:
+                            logging.getLogger("uvicorn.error").warning(
+                                "dropping malformed data-URL image attachment: %s", e)
                     elif val.startswith("http"):
                         try:
                             from curl_cffi.requests import AsyncSession as AS
@@ -391,8 +404,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                                 ct = dr.headers.get("content-type", "image/png").split(";")[0]
                                 file_jobs.append({"name": val.split("?")[0].split("/")[-1] or "image",
                                                   "data": dr.content, "mime": ct})
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logging.getLogger("uvicorn.error").warning(
+                                "attachment download failed (%s): %s", val[:120], e)
                     else:
                         # grok file id passed through
                         file_jobs.append({"file_id": val})
@@ -403,8 +417,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                         try:
                             data, mime, _ = decode_data_url(url)
                             file_jobs.append({"name": "image", "data": data, "mime": mime})
-                        except UploadError:
-                            pass
+                        except UploadError as e:
+                            logging.getLogger("uvicorn.error").warning(
+                                "dropping malformed data-URL image attachment: %s", e)
                     elif url.startswith("http"):
                         try:
                             from curl_cffi.requests import AsyncSession as AS
@@ -412,8 +427,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                                 dr = await s.get(url, timeout=30)
                                 ct = dr.headers.get("content-type", "image/png").split(";")[0]
                                 file_jobs.append({"name": "image", "data": dr.content, "mime": ct})
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logging.getLogger("uvicorn.error").warning(
+                                "attachment download failed (%s): %s", url[:120], e)
             elif t == "input_file" or t == "file":
                 fd = p.get("file") or {}
                 name = fd.get("filename") or p.get("filename") or "file"
@@ -424,8 +440,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                         try:
                             data, mime, _ = decode_data_url(val)
                             file_jobs.append({"name": name, "data": data, "mime": mime})
-                        except UploadError:
-                            pass
+                        except UploadError as e:
+                            logging.getLogger("uvicorn.error").warning(
+                                "dropping malformed data-URL file attachment (%s): %s", name, e)
                 elif isinstance(fd.get("file_id"), str):
                     file_jobs.append({"file_id": fd["file_id"]})
                 elif isinstance(p.get("file_url"), str):
@@ -435,8 +452,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                             dr = await s.get(p["file_url"], timeout=30)
                             file_jobs.append({"name": name, "data": dr.content,
                                               "mime": mime or dr.headers.get("content-type", "").split(";")[0]})
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.getLogger("uvicorn.error").warning(
+                            "attachment download failed (%s): %s", p["file_url"][:120], e)
         out.append({**msg, "content": "\n".join(x for x in new_parts)})
     return out, file_jobs
 
@@ -480,57 +498,202 @@ def now_epoch() -> int:
 
 # -------------------------------------------------------------- image upload
 
+def _job_hash(job: dict) -> str | None:
+    """Stable content hash for an attachment job (None when there are no bytes).
+
+    Covers bytes only: identical content re-sent under a different name/mime
+    intentionally reuses the original upload (grok keeps that upload's stored
+    metadata) instead of paying for a second upload.
+    """
+    data = job.get("data")
+    if isinstance(data, (bytes, bytearray)):
+        return hashlib.sha256(bytes(data)).hexdigest()
+    return None
+
+
+def _clean_attachment_registry(entries: Any) -> list[dict]:
+    """Validate + cap a stored attachment registry (oldest first, newest kept)."""
+    return clean_attachment_rows(entries)
+
+
+def _session_attachments(sess: Any) -> list[dict]:
+    return _clean_attachment_registry(getattr(sess, "attachments", None))
+
+
+def _propagate_dropped_attachments(source_sess: Any, forked_sess: Any) -> None:
+    """Carry stale-id invalidations from a turn back to its source checkpoint.
+
+    Checkpoints stay immutable for branching (fork_session_state), but a file
+    id stream_session_turn declared stale is dead everywhere: re-mentioning it
+    on the next failover attempt would only burn another failed gateway turn.
+    Only explicitly dropped ids are removed - never cap evictions or new
+    uploads.
+    """
+    dropped = getattr(forked_sess, "last_dropped_attachment_ids", None)
+    if not dropped:
+        return
+    src = _clean_attachment_registry(getattr(source_sess, "attachments", None))
+    if not src:
+        return
+    dead = set(dropped)
+    source_sess.attachments = [e for e in src if e["file_id"] not in dead]
+
+
 async def stream_session_turn(sess: GrokSession, prompt: str, *,
                               attachment_ids=None, system_prompt=None,
                               file_jobs=None) -> AsyncIterator[dict]:
     """Yield gateway events in real time (text_delta / reasoning_delta /
     image_url / done). Files are per-account on grok.com ("FileAttachment
     not found" on cross-account mentions), so upload with THIS session's
-    account right before the turn."""
+    account right before the turn.
+
+    Cross-turn attachment memory: the gateway only "sees" files mentioned on
+    the CURRENT message, so a follow-up turn would otherwise ship a bare
+    prompt and the model denies ever receiving earlier images (the 2026-08-28
+    "top 3" incident: turn 1 attached two images, turn 2 "top 3" answered
+    "I can't see the images you attached"). Uploaded ids are therefore
+    remembered on the session and re-mentioned on every turn; replayed bytes
+    are deduplicated by content hash instead of being uploaded again.
+    """
+    registry = _session_attachments(sess)
+    sess.last_dropped_attachment_ids = set()
+    known_hashes = {e["hash"]: e["file_id"] for e in registry if e["hash"]}
+    mention_ids: list[str] = []
+    prior_mentioned: list[str] = []   # remembered ids from earlier turns
+    turn_ids: list[str] = []          # ids resolved from THIS request's jobs
+
+    def _mention(fid: str) -> None:
+        if fid and fid not in mention_ids:
+            mention_ids.append(fid)
+
+    def _turn_mention(fid: str) -> None:
+        """Mention an id resolved from this request; it survives the cap."""
+        if not fid:
+            return
+        if fid not in turn_ids:
+            turn_ids.append(fid)
+        _mention(fid)
+
+    # Remembered images ride along so follow-up turns still "see" earlier files.
+    for e in registry:
+        _mention(e["file_id"])
+        prior_mentioned.append(e["file_id"])
+
+    upload_errors: list[str] = []
+    upload_succeeded = False
+    new_entries: list[dict] = []      # freshly uploaded ids -> remember
+    caller_ids: list[str] = []        # caller/file_id passthroughs -> remember
     if file_jobs:
-        upload_errors: list[str] = []
-        upload_succeeded = False
+        # Passthrough file-id jobs need no upload machinery; handle them for
+        # every request shape, not only when byte-upload jobs exist.
+        for job in file_jobs[:6]:
+            if "file_id" not in job:
+                continue
+            fid = job["file_id"]
+            _turn_mention(fid)
+            if fid not in prior_mentioned:
+                caller_ids.append(fid)
         has_upload_jobs = any("file_id" not in j for j in file_jobs[:6])
-        try:
-            from curl_cffi.requests import AsyncSession as AS
-            await refresh_statsig_pair()
-            async with AS(impersonate="chrome") as s:
-                for job in file_jobs[:6]:
-                    if "file_id" in job:
-                        attachment_ids = (attachment_ids or []) + [job["file_id"]]
-                        continue
-                    name = job.get("name") or "file"
-                    try:
-                        fm = await upload_file(s, sess.cookie_header, statsig,
-                                               name,
-                                               job.get("data") or b"",
-                                               job.get("mime"))
-                    except Exception as e:
-                        upload_errors.append(f"{name}: {e}")
-                        continue
-                    fid = fm.get("fileMetadataId")
-                    if fid:
-                        attachment_ids = (attachment_ids or []) + [fid]
-                        upload_succeeded = True
-                    else:
-                        upload_errors.append(f"{name}: upload returned no fileMetadataId")
-        except Exception as e:
-            upload_errors.append(str(e))
-        if upload_errors and has_upload_jobs and not upload_succeeded:
-            # Never ship a prompt whose attachments were all dropped: grok
-            # then confidently answers "you didn't attach anything" (the
-            # 2026-08-25 "fact check this" incident). Pre-existing
-            # attachment ids do not rescue a fully-failed batch - those new
-            # files are simply gone. Fail the turn so the caller fails over
-            # to another account or errors out honestly.
-            raise GatewayError(
-                "upstream", "attachment upload failed: " + "; ".join(upload_errors[:3]))
-        if upload_errors:
+        if has_upload_jobs:
+            try:
+                from curl_cffi.requests import AsyncSession as AS
+                await refresh_statsig_pair()
+                async with AS(impersonate="chrome") as s:
+                    for job in file_jobs[:6]:
+                        if "file_id" in job:
+                            continue
+                        name = job.get("name") or "file"
+                        job_hash = _job_hash(job)
+                        if job_hash and known_hashes.get(job_hash):
+                            # Same bytes already uploaded on this account:
+                            # re-mention instead of uploading again. Bump the
+                            # entry to most-recent so both caps keep it.
+                            fid = known_hashes[job_hash]
+                            _turn_mention(fid)
+                            entry = next((x for x in registry
+                                          if x["file_id"] == fid), None)
+                            if entry is not None:
+                                registry = [x for x in registry
+                                            if x is not entry] + [entry]
+                            continue
+                        try:
+                            fm = await upload_file(s, sess.cookie_header, statsig,
+                                                   name,
+                                                   job.get("data") or b"",
+                                                   job.get("mime"))
+                        except Exception as e:
+                            upload_errors.append(f"{name}: {e}")
+                            continue
+                        fid = fm.get("fileMetadataId")
+                        if fid:
+                            upload_succeeded = True
+                            _turn_mention(fid)
+                            new_entries.append({"file_id": fid, "hash": job_hash})
+                        else:
+                            upload_errors.append(f"{name}: upload returned no fileMetadataId")
+            except Exception as e:
+                upload_errors.append(str(e))
+            if upload_errors and not upload_succeeded:
+                # Never ship a prompt whose attachments were all dropped: grok
+                # then confidently answers "you didn't attach anything" (the
+                # 2026-08-25 "fact check this" incident). Remembered ids do
+                # not rescue a fully-failed batch - those new files are
+                # simply gone. Fail the turn so the caller fails over to
+                # another account or errors out honestly.
+                raise GatewayError(
+                    "upstream", "attachment upload failed: " + "; ".join(upload_errors[:3]))
+            if upload_errors:
+                logging.getLogger("uvicorn.error").warning(
+                    "some attachments failed to upload: %s", "; ".join(upload_errors[:3]))
+    for aid in attachment_ids or []:
+        if isinstance(aid, str) and aid:
+            _turn_mention(aid)
+            if aid not in prior_mentioned:
+                caller_ids.append(aid)
+
+    seen_ids = {e["file_id"] for e in registry}
+    for e in new_entries + [{"file_id": fid, "hash": None} for fid in caller_ids]:
+        if e["file_id"] not in seen_ids:
+            registry.append(e)
+            seen_ids.add(e["file_id"])
+    registry = registry[-MAX_TRACKED_ATTACHMENTS:]
+    sess.attachments = registry
+
+    # Current-turn ids survive the mention cap; remembered context fills the
+    # rest, newest last. (A dedupe hit on an old entry must not be evicted in
+    # favor of never-referenced newer remembered ids.)
+    turn_set = set(turn_ids)
+    mention_ids = ([i for i in mention_ids if i not in turn_set]
+                   + [i for i in turn_ids if i in mention_ids])[-MAX_TURN_MENTIONS:]
+    events_yielded = False
+    try:
+        async for ev in sess.ask(prompt, attachment_ids=mention_ids or None,
+                                 system_prompt=system_prompt, user_text=prompt):
+            events_yielded = True
+            yield ev
+    except GatewayError as e:
+        # Remembered ids can go stale (grok expires files). If the turn fails
+        # with a file-flavored error before anything streamed, retry once
+        # without them instead of failing over forever. Only ids actually
+        # mentioned this turn may be declared stale: ids capped out of the
+        # mention list were never sent, and freshly uploaded ids are not the
+        # likely culprit.
+        msg = str(e).lower()
+        stale = set(mention_ids) & set(prior_mentioned)
+        if (stale and not events_yielded
+                and any(w in msg for w in ATTACHMENT_ERROR_WORDS)):
             logging.getLogger("uvicorn.error").warning(
-                "some attachments failed to upload: %s", "; ".join(upload_errors[:3]))
-    async for ev in sess.ask(prompt, attachment_ids=attachment_ids,
-                             system_prompt=system_prompt, user_text=prompt):
-        yield ev
+                "dropping %d remembered attachment id(s) after gateway error: %s",
+                len(stale), e)
+            sess.last_dropped_attachment_ids = set(stale)
+            registry = [e for e in registry if e["file_id"] not in stale]
+            sess.attachments = registry
+            retry_ids = [i for i in mention_ids if i not in stale]
+            async for ev in sess.ask(prompt, attachment_ids=retry_ids or None,
+                                     system_prompt=system_prompt, user_text=prompt):
+                yield ev
+        else:
+            raise
 
 
 async def run_session_turn(sess: GrokSession, prompt: str, *,
@@ -576,6 +739,8 @@ async def pick_account_and_stream_turn(session_key: str | None,
                             sess = GrokSession(acc_cand.cookie_header(), uid, mode)
                             sess.conversation_id = persisted.get("conversation_id", "")
                             sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+                            sess.attachments = _clean_attachment_registry(
+                                persisted.get("attachments"))
                             st = SessionState(
                                 account_key=acc_cand.key,
                                 grok=sess,
@@ -588,7 +753,8 @@ async def pick_account_and_stream_turn(session_key: str | None,
                 acc = pool.acquire_by_key(st.account_key)
                 if acc:
                     attempts += 1
-                    st = await fork_session_state(st, mode)
+                    source_state = st
+                    st = await fork_session_state(source_state, mode)
                     st.touch()
                     store.touch_session(session_key, st.last_used)
                     yielded_any = False
@@ -604,12 +770,14 @@ async def pick_account_and_stream_turn(session_key: str | None,
                             ev["state"] = st
                             yield ev
                             if ev.get("type") == "done":
+                                _propagate_dropped_attachments(source_state.grok, st.grok)
                                 pool.release_ok(acc)
                                 return
                     except GatewayError as e:
                         pool.release_fail(acc, e.kind if e.kind in
                                           ("auth", "quota", "degraded") else "generic")
                         await st.grok.close()
+                        _propagate_dropped_attachments(source_state.grok, st.grok)
                         if yielded_any:
                             status = 429 if e.kind == "quota" else 502
                             raise HTTPException(status, f"grok error ({e.kind}): {e}")
@@ -828,6 +996,8 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                             sess = GrokSession(acc_cand.cookie_header(), uid, mode)
                             sess.conversation_id = persisted.get("conversation_id", "")
                             sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+                            sess.attachments = _clean_attachment_registry(
+                                persisted.get("attachments"))
                             st = SessionState(
                                 account_key=acc_cand.key,
                                 grok=sess,
@@ -842,7 +1012,8 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                     continued = True
                     attempts += 1
                     try:
-                        st = await fork_session_state(st, mode)
+                        source_state = st
+                        st = await fork_session_state(source_state, mode)
                         st.touch()
                         store.touch_session(session_key, st.last_used)
                         result, events = await run_session_turn(
@@ -850,11 +1021,13 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                             attachment_ids=kwargs.get("attachment_ids"),
                             file_jobs=kwargs.get("file_jobs"),
                             system_prompt=kwargs.get("system_prompt"))
+                        _propagate_dropped_attachments(source_state.grok, st.grok)
                         pool.release_ok(acc)
                         return acc, result, events, st
                     except GatewayError as e:
                         pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                         await st.grok.close()
+                        _propagate_dropped_attachments(source_state.grok, st.grok)
         acc = pool.acquire()
         if acc is None:
             raise HTTPException(503, "no accounts available")
@@ -1020,6 +1193,7 @@ async def chat_completions(request: Request):
                 conversation_id=state.grok.conversation_id,
                 last_parent_response_id=state.grok.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(state.grok),
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
@@ -1152,6 +1326,7 @@ async def chat_completions(request: Request):
                     conversation_id=turn_state.grok.conversation_id,
                     last_parent_response_id=turn_state.grok.last_parent_response_id,
                     model_mode=mode,
+                    attachments=_session_attachments(turn_state.grok),
                     created_at=st.created_at,
                     last_used=st.last_used,
                 )
@@ -1247,6 +1422,8 @@ async def responses_api(request: Request):
                         sess = GrokSession(acc_cand.cookie_header(), await _uid_for(acc_cand), persisted.get("model_mode", "fast"))
                         sess.conversation_id = persisted.get("conversation_id", "")
                         sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+                        sess.attachments = _clean_attachment_registry(
+                            persisted.get("attachments"))
                         sess_prev = SessionState(
                             account_key=acc_cand.key,
                             grok=sess,
@@ -1306,11 +1483,13 @@ async def responses_api(request: Request):
                 result, events = await run_session_turn(
                     st.grok, prompt, file_jobs=remaining_jobs or None,
                     system_prompt=instructions)
+                _propagate_dropped_attachments(sess_prev.grok, st.grok)
                 pool.release_ok(acc)
                 state = st
             except GatewayError as e:
                 pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                 await st.grok.close()
+                _propagate_dropped_attachments(sess_prev.grok, st.grok)
                 raise HTTPException(429 if e.kind == "quota" else 502, f"grok error ({e.kind}): {e}")
         else:
             acc, result, events, state = await pick_account_and_turn(
@@ -1337,6 +1516,7 @@ async def responses_api(request: Request):
                 conversation_id=state.grok.conversation_id,
                 last_parent_response_id=state.grok.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(state.grok),
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
@@ -1347,6 +1527,7 @@ async def responses_api(request: Request):
                 conversation_id=state.grok.conversation_id,
                 last_parent_response_id=state.grok.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(state.grok),
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
@@ -1357,6 +1538,7 @@ async def responses_api(request: Request):
                 conversation_id=state.grok.conversation_id,
                 last_parent_response_id=state.grok.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(state.grok),
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
@@ -1477,10 +1659,12 @@ async def responses_api(request: Request):
                                     "output_index": 0, "content_index": 0, "delta": clean_delta})
                         elif ev_type == "done":
                             final_turn_result = ev.get("result")
+                    _propagate_dropped_attachments(sess_prev.grok, st.grok)
                     pool.release_ok(acc)
                 except GatewayError as e:
                     pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                     await st.grok.close()
+                    _propagate_dropped_attachments(sess_prev.grok, st.grok)
                     _fail_turn(e)
         elif isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
             mock_res = await pick_account_and_turn(
@@ -1572,6 +1756,7 @@ async def responses_api(request: Request):
                 conversation_id=turn_state.grok.conversation_id,
                 last_parent_response_id=turn_state.grok.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(turn_state.grok),
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
@@ -1582,6 +1767,7 @@ async def responses_api(request: Request):
                 conversation_id=turn_state.grok.conversation_id,
                 last_parent_response_id=turn_state.grok.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(turn_state.grok),
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
@@ -1592,6 +1778,7 @@ async def responses_api(request: Request):
                 conversation_id=turn_state.grok.conversation_id,
                 last_parent_response_id=turn_state.grok.last_parent_response_id,
                 model_mode=mode,
+                attachments=_session_attachments(turn_state.grok),
                 created_at=st.created_at,
                 last_used=st.last_used,
             )
