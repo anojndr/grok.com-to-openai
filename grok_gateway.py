@@ -331,6 +331,7 @@ class GrokSession:
     def __init__(self, cookie_header: str, user_id: str, model_mode: str = "fast"):
         self.cookie_header, self.user_id, self.model_mode = cookie_header, user_id, model_mode
         self.ws = None
+        self.ws_mode = model_mode   # mode the live ws session was negotiated with
         self.conversation_id = ""
         self.last_parent_response_id = ""
         # Uploaded attachments made visible on this conversation, oldest first:
@@ -357,6 +358,9 @@ class GrokSession:
         return sess
 
     async def connect(self) -> None:
+        # A reconnect (e.g. model-mode switch on a warm socket) must not
+        # orphan the previous live connection.
+        await self.close()
         uri = f"wss://grok.com/ws/mgw/?uid={self.user_id}"
         headers = {"Origin": GROK_BASE, "User-Agent": USER_AGENT,
                    "Accept-Language": "en-US,en;q=0.9", "Cookie": self.cookie_header}
@@ -381,6 +385,7 @@ class GrokSession:
                 if ev.get("type") == "session.created":
                     if not self.conversation_id:
                         self.conversation_id = env.get("session_id") or ""
+                    self.ws_mode = self.model_mode
                     got_session_id = True
                 elif ev.get("type") == "error":
                     raise GatewayError("upstream", json.dumps(ev.get("error"))[:200])
@@ -407,7 +412,8 @@ class GrokSession:
         async with self.lock:
             completed_turn = False
             try:
-                if not self.alive(): await self.connect()
+                if not self.alive() or self.ws_mode != self.model_mode:
+                    await self.connect()
                 chunks = []
                 if system_prompt: chunks.append({"text": {"text": system_prompt + "\n\n"}})
                 if attachment_ids:

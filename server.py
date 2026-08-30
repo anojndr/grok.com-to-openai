@@ -89,12 +89,22 @@ def _clone_session_state(state: SessionState, mode: str | None = None) -> Sessio
 
 
 async def fork_session_state(state: SessionState, mode: str | None = None) -> SessionState:
-    """Snapshot a checkpoint before advancing a conversation branch."""
+    """Snapshot a checkpoint before advancing a conversation branch.
+
+    The live WebSocket is MOVED to the fork, not closed: sequential turns
+    (the common case) keep the connection warm and skip the ~1s reconnect
+    (TLS + WS handshake + session.create) that fork-then-reconnect paid on
+    every request. A later fork from THIS checkpoint reconnects on demand
+    via ask(); the clone carries conversation_id and last_parent_response_id
+    either way, so branch semantics are unchanged.
+    """
     source = state.grok
     if isinstance(source, GrokSession):
         async with source.lock:
             fork = _clone_session_state(state, mode)
-            await source.close()
+            fork.grok.ws = source.ws
+            fork.grok.ws_mode = source.ws_mode
+            source.ws = None
             return fork
     return _clone_session_state(state, mode)
 
@@ -128,7 +138,8 @@ async def prune_sessions() -> None:
 
 async def get_or_create_session(prefix_key: str | None, users: list[str],
                                 acc, mode: str = "fast") -> tuple[GrokSession, bool]:
-    """Return a disconnected session forked from the requested chain checkpoint."""
+    """Return a session forked from the requested chain checkpoint; the fork
+    carries the live WebSocket when the checkpoint had one."""
     uid = await _uid_for(acc)
     async with SESSION_LOCK:
         if prefix_key:
@@ -784,7 +795,7 @@ async def pick_account_and_stream_turn(session_key: str | None,
                         continue
                     finally:
                         if not yielded_any:
-                            pass
+                            await st.grok.close()
         acc = pool.acquire()
         if acc is None:
             raise HTTPException(503, "no accounts available")
@@ -1011,11 +1022,13 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                 if acc:
                     continued = True
                     attempts += 1
+                    turned_ok, forked = False, None
                     try:
                         source_state = st
                         st = await fork_session_state(source_state, mode)
                         st.touch()
                         store.touch_session(session_key, st.last_used)
+                        forked = st.grok
                         result, events = await run_session_turn(
                             st.grok, kwargs.get("prompt"),
                             attachment_ids=kwargs.get("attachment_ids"),
@@ -1023,11 +1036,17 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                             system_prompt=kwargs.get("system_prompt"))
                         _propagate_dropped_attachments(source_state.grok, st.grok)
                         pool.release_ok(acc)
+                        turned_ok = True
                         return acc, result, events, st
                     except GatewayError as e:
                         pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                         await st.grok.close()
                         _propagate_dropped_attachments(source_state.grok, st.grok)
+                    finally:
+                        # Cancellation before the turn ran (or non-GatewayError
+                        # failure) must not orphan the moved live socket.
+                        if not turned_ok and forked is not None:
+                            await forked.close()
         acc = pool.acquire()
         if acc is None:
             raise HTTPException(503, "no accounts available")
@@ -1477,7 +1496,9 @@ async def responses_api(request: Request):
             acc = pool.acquire_by_key(sess_prev.account_key)
             if not acc:
                 raise HTTPException(409, "previous response account is cooling down; retry")
+            turned_ok, forked = False, None
             st = await fork_session_state(sess_prev, mode)
+            forked = st.grok
             st.touch()
             try:
                 result, events = await run_session_turn(
@@ -1485,12 +1506,16 @@ async def responses_api(request: Request):
                     system_prompt=instructions)
                 _propagate_dropped_attachments(sess_prev.grok, st.grok)
                 pool.release_ok(acc)
+                turned_ok = True
                 state = st
             except GatewayError as e:
                 pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                 await st.grok.close()
                 _propagate_dropped_attachments(sess_prev.grok, st.grok)
                 raise HTTPException(429 if e.kind == "quota" else 502, f"grok error ({e.kind}): {e}")
+            finally:
+                if not turned_ok and forked is not None:
+                    await forked.close()
         else:
             acc, result, events, state = await pick_account_and_turn(
                 prefix_key, users[:], mode=mode, prompt=prompt,
@@ -1640,7 +1665,9 @@ async def responses_api(request: Request):
                 _fail_turn(HTTPException(409, "previous response account is cooling down; retry"))
                 acc = None
             if acc is not None:
+                turned_ok, forked = False, None
                 st = await fork_session_state(sess_prev, mode)
+                forked = st.grok
                 st.touch()
                 turn_acc = acc
                 turn_state = st
@@ -1661,11 +1688,15 @@ async def responses_api(request: Request):
                             final_turn_result = ev.get("result")
                     _propagate_dropped_attachments(sess_prev.grok, st.grok)
                     pool.release_ok(acc)
+                    turned_ok = True
                 except GatewayError as e:
                     pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                     await st.grok.close()
                     _propagate_dropped_attachments(sess_prev.grok, st.grok)
                     _fail_turn(e)
+                finally:
+                    if not turned_ok and forked is not None:
+                        await forked.close()
         elif isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
             mock_res = await pick_account_and_turn(
                 prefix_key, users[:], mode=mode, prompt=prompt,
