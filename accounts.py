@@ -139,18 +139,34 @@ class AccountPool:
     def snapshot(self) -> list[Account]:
         return list(self._accounts)
 
-    def acquire(self) -> Account | None:
-        """Round-robin over available accounts (skips cooling-down ones)."""
-        accounts = [a for a in self._accounts if a.available()]
-        if not accounts:
-            # fall back to least-cooled account (excluding actively quarantined degraded ones)
+    def acquire(self, exclude: set[str] | None = None,
+                include_degraded: bool = False) -> Account | None:
+        """Pick the next account to serve a request.
+
+        Round-robins over available accounts, skipping every key in
+        `exclude` so a failover request can hand each attempt a distinct
+        account. When none are available, the soonest-recoverable cooling
+        account is used; degraded-quarantined accounts only join that
+        last-resort pool when `include_degraded` is set (turn failover sets
+        it so every account is tried before surfacing an error — the
+        degraded-turn detector still aborts a bad turn before it completes).
+        """
+        exclude = exclude or set()
+        candidates = [a for a in self._accounts if a.sso and a.key not in exclude]
+        if not candidates:
+            return None
+        available = [a for a in candidates if a.available()]
+        if available:
+            acc = available[next(self._rr) % len(available)]
+        else:
             now = time.time()
-            live = [a for a in self._accounts if a.sso and now >= a.degraded_until]
-            if not live:
+            cooling = [a for a in candidates if now >= a.degraded_until]
+            if not cooling and include_degraded:
+                cooling = candidates
+            if not cooling:
                 return None
-            accounts = sorted(live, key=lambda a: a.cooldown_until)[:1]
-        idx = next(self._rr) % len(accounts)
-        acc = accounts[idx]
+            acc = min(cooling,
+                      key=lambda a: (max(a.cooldown_until, a.degraded_until), a.index))
         acc.total_requests += 1
         if self.store:
             self.store.save_account_state(

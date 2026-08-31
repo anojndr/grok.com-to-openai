@@ -396,9 +396,19 @@ class GrokSession:
                     got_session_id = True
                 elif ev.get("type") == "error":
                     raise GatewayError("upstream", json.dumps(ev.get("error"))[:200])
-        except Exception:
+        except GatewayError:
             await self.close()
             raise
+        except asyncio.TimeoutError as e:
+            await self.close()
+            raise GatewayError("timeout",
+                               "gateway connect or handshake timed out") from e
+        except Exception as e:
+            await self.close()
+            # Raw socket/TLS errors must fail over like any other retryable
+            # gateway failure instead of escaping as a 500.
+            raise GatewayError("upstream",
+                               f"connect failed: {type(e).__name__}: {e}") from e
 
     async def close(self) -> None:
         if self.ws:

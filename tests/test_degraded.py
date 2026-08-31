@@ -375,6 +375,126 @@ class FailoverTests(unittest.TestCase):
             server.run_session_turn = real_run
         self.assertEqual(ctx.exception.status_code, 502)
 
+    def test_failover_tries_every_account_before_raising(self):
+        pool = make_pool(self._tmp.name, n=7)
+        calls: list[str] = []
+
+        async def fake_run(sess, prompt, **kwargs):
+            calls.append(sess.cookie_header)
+            raise GatewayError("degraded", "gateway searched unrelated content")
+
+        real_pool = server.pool
+        real_run = server.run_session_turn
+        server.pool = pool
+        server.run_session_turn = fake_run
+        try:
+            with self.assertRaises(Exception) as ctx:
+                asyncio.run(server.pick_account_and_turn(
+                    None, ["hi"], mode="fast", prompt="hi"))
+        finally:
+            server.pool = real_pool
+            server.run_session_turn = real_run
+
+        # every account tried exactly once — even past the old 5-attempt cap
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(len(set(calls)), 7)
+        self.assertEqual(ctx.exception.status_code, 502)
+
+    def test_degraded_quarantined_accounts_get_last_resort_attempt(self):
+        pool = make_pool(self._tmp.name, n=3)
+        for a in pool.snapshot():
+            pool.release_fail(a, "degraded")
+        calls: list[str] = []
+
+        async def fake_run(sess, prompt, **kwargs):
+            calls.append(sess.cookie_header)
+            if len(calls) < 3:
+                raise GatewayError("degraded", "gateway searched unrelated content")
+            return TurnResult(text="ok"), []
+
+        real_pool = server.pool
+        real_run = server.run_session_turn
+        server.pool = pool
+        server.run_session_turn = fake_run
+        try:
+            acc, result, events, state = asyncio.run(
+                server.pick_account_and_turn(None, ["hi"], mode="fast",
+                                             prompt="hi"))
+        finally:
+            server.pool = real_pool
+            server.run_session_turn = real_run
+
+        self.assertEqual(result.text, "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(set(calls)), 3)
+
+    def test_stream_failover_tries_every_account_before_raising(self):
+        pool = make_pool(self._tmp.name, n=6)
+        calls: list[str] = []
+
+        async def fake_stream(sess, prompt, **kwargs):
+            calls.append(sess.cookie_header)
+            raise GatewayError("upstream", "boom")
+            yield  # pragma: no cover - makes this an async generator
+
+        real_pool = server.pool
+        real_stream = server.stream_session_turn
+        server.pool = pool
+        server.stream_session_turn = fake_stream
+        try:
+            with self.assertRaises(Exception) as ctx:
+                async def consume():
+                    async for _ in server.pick_account_and_stream_turn(
+                            None, ["hi"], mode="fast", prompt="hi"):
+                        pass
+                asyncio.run(consume())
+        finally:
+            server.pool = real_pool
+            server.stream_session_turn = real_stream
+
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(set(calls)), 6)
+        self.assertEqual(ctx.exception.status_code, 502)
+
+    def test_stream_continuation_guard_prevents_zero_cooldown_loop(self):
+        # G2O_COOLDOWN=0: release_fail leaves the account immediately
+        # available, so the continuation branch must not re-attempt an
+        # already-tried account or the walk never reaches the pool tail.
+        pool = make_pool(self._tmp.name, n=2)
+        for a in pool.snapshot():
+            a.cooldown_until = 0.0
+            a.degraded_until = 0.0
+        acc0 = pool.snapshot()[0]
+        sess0 = GrokSession("sso-token-1", "uid-01")  # no live socket
+        sess0.conversation_id = "conv-1"  # makes the continuation branch eligible
+        server.SESSIONS["sess-key"] = server.SessionState(
+            account_key=acc0.key, grok=sess0, user_chain=["hi"])
+        calls: list[str] = []
+
+        async def fake_stream(sess, prompt, **kwargs):
+            calls.append(sess.cookie_header)
+            raise GatewayError("upstream", "boom")
+            yield  # pragma: no cover - makes this an async generator
+
+        real_pool = server.pool
+        real_stream = server.stream_session_turn
+        server.pool = pool
+        server.stream_session_turn = fake_stream
+        try:
+            with self.assertRaises(Exception) as ctx:
+                async def consume():
+                    async for _ in server.pick_account_and_stream_turn(
+                            "sess-key", ["hi"], mode="fast", prompt="hi"):
+                        pass
+                asyncio.run(asyncio.wait_for(consume(), timeout=10))
+        finally:
+            server.pool = real_pool
+            server.stream_session_turn = real_stream
+
+        # continuation account + the one untried account, each exactly once
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(set(calls)), 2)
+        self.assertEqual(ctx.exception.status_code, 502)
 
 
 class ImageEditDegradedTests(unittest.TestCase):

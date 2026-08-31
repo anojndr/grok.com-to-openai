@@ -739,12 +739,16 @@ async def pick_account_and_stream_turn(session_key: str | None,
         -> AsyncIterator[dict]:
     """Real-time turn: pick an account and yield raw gateway events as they
     arrive over the WebSocket. Failover happens only while nothing has been
-    yielded yet; once the first event is out the stream is committed.
+    yielded yet; once the first event is out the stream is committed. The
+    failover walk tries every account in the pool exactly once (degraded-
+    quarantined ones included as a last resort) before surfacing the last
+    GatewayError.
 
     Yields dicts of shape {"type": <event>, ..., "acc", "state"}; the final
     event carries type "done" with "result"/"usage".
     """
-    attempts = 0
+    tried: set[str] = set()
+    last_err: GatewayError | None = None
     mode = kwargs.get("mode") or "fast"
     while True:
         await pool.reload_if_changed()
@@ -773,8 +777,8 @@ async def pick_account_and_stream_turn(session_key: str | None,
                             SESSIONS[session_key] = st
             if st and (st.grok.alive() or st.grok.conversation_id):
                 acc = pool.acquire_by_key(st.account_key)
-                if acc:
-                    attempts += 1
+                if acc and acc.key not in tried:
+                    tried.add(acc.key)
                     source_state = st
                     st = await fork_session_state(source_state, mode)
                     st.touch()
@@ -803,14 +807,19 @@ async def pick_account_and_stream_turn(session_key: str | None,
                         if yielded_any:
                             status = 429 if e.kind == "quota" else 502
                             raise HTTPException(status, f"grok error ({e.kind}): {e}")
+                        last_err = e
                         continue
                     finally:
                         if not yielded_any:
                             await st.grok.close()
-        acc = pool.acquire()
+        acc = pool.acquire(exclude=tried, include_degraded=True)
         if acc is None:
+            if last_err is not None:
+                status = 429 if last_err.kind == "quota" else 502
+                raise HTTPException(status,
+                                    f"grok error ({last_err.kind}): {last_err}")
             raise HTTPException(503, "no accounts available")
-        attempts += 1
+        tried.add(acc.key)
         sess = None
         yielded_any = False
         try:
@@ -840,32 +849,32 @@ async def pick_account_and_stream_turn(session_key: str | None,
             if yielded_any:
                 status = 429 if e.kind == "quota" else 502
                 raise HTTPException(status, f"grok error ({e.kind}): {e}")
-            if attempts >= max(3, min(len(pool.snapshot()) or 1, 5)) \
-                    or not any(a.available() for a in pool.snapshot()):
-                status = 429 if e.kind == "quota" else 502
-                raise HTTPException(status, f"grok error ({e.kind}): {e}")
+            last_err = e
 
 
 
 
 async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
     """Text-to-image via the Imagine WebSocket (wss://grok.com/ws/imagine/listen).
-    Rotates across accounts on rate limit. Returns list of public image URLs."""
+    Rotates across accounts until one produces images or the whole pool has
+    been tried. Returns list of public image URLs."""
     import uuid as _uuid
     import websockets
 
-    max_attempts = min(4, len(pool.snapshot()) or 1)
     last_err = None
+    tried: set[str] = set()
 
-    for attempt in range(max_attempts):
-        acc = pool.acquire()
+    while True:
+        acc = pool.acquire(exclude=tried, include_degraded=True)
         if acc is None:
             break
+        tried.add(acc.key)
         cookie = acc.cookie_header()
         try:
             uid = await gw.resolve_user_id(cookie)
-        except GatewayError:
+        except GatewayError as e:
             pool.release_fail(acc, "auth")
+            last_err = f"account {acc.index}: {e}"
             continue
 
         uri = "wss://grok.com/ws/imagine/listen"
@@ -933,7 +942,9 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
             jpg = [u for u in urls if u.endswith(".jpg")]
             return jpg if jpg else urls
 
-    raise RuntimeError(f"all {max_attempts} attempts failed; last: {last_err}")
+    if last_err is None:
+        raise RuntimeError("no accounts available for image generation")
+    raise RuntimeError(f"all {len(tried)} account(s) tried; last: {last_err}")
 
 
 
@@ -999,12 +1010,18 @@ async def host_images(urls: list[str], cookie: str = "") -> list[str]:
 
 
 async def pick_account_and_turn(session_key: str | None, users: list[str], **kwargs):
-    """Pick an account; reuse its live grok session when continuing a chain."""
-    attempts = 0
+    """Pick an account; reuse its live grok session when continuing a chain.
+
+    Every retryable failure fails over to the next account; the walk only
+    stops after every account in the pool has been tried once (`tried` keys
+    keep attempts distinct, degraded-quarantined ones included as a last
+    resort), then the last GatewayError surfaces.
+    """
+    tried: set[str] = set()
+    last_err: GatewayError | None = None
     mode = kwargs.get("mode") or "fast"
     while True:
         await pool.reload_if_changed()
-        continued = False
         if session_key:
             st = None
             async with SESSION_LOCK:
@@ -1030,9 +1047,8 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                             SESSIONS[session_key] = st
             if st and (st.grok.alive() or st.grok.conversation_id):
                 acc = pool.acquire_by_key(st.account_key)
-                if acc:
-                    continued = True
-                    attempts += 1
+                if acc and acc.key not in tried:
+                    tried.add(acc.key)
                     turned_ok, forked = False, None
                     try:
                         source_state = st
@@ -1053,15 +1069,21 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                         pool.release_fail(acc, e.kind if e.kind in ("auth", "quota", "degraded") else "generic")
                         await st.grok.close()
                         _propagate_dropped_attachments(source_state.grok, st.grok)
+                        last_err = e
                     finally:
                         # Cancellation before the turn ran (or non-GatewayError
                         # failure) must not orphan the moved live socket.
                         if not turned_ok and forked is not None:
                             await forked.close()
-        acc = pool.acquire()
+        acc = pool.acquire(exclude=tried, include_degraded=True)
         if acc is None:
+            if last_err is not None:
+                status = 429 if last_err.kind == "quota" else 502
+                raise HTTPException(status,
+                                    f"grok error ({last_err.kind}): {last_err}")
             raise HTTPException(503, "no accounts available")
-        attempts += 1
+        tried.add(acc.key)
+        sess = None
         try:
             sess, _ = await get_or_create_session(None, users, acc, mode=mode)
             result, events = await run_session_turn(
@@ -1073,15 +1095,14 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
             state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
             return acc, result, events, state
         except GatewayError as e:
-            try:
-                await sess.close()
-            except Exception:
-                pass
+            if sess is not None:
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
             kind = e.kind if e.kind in ("auth", "quota", "degraded") else "generic"
             pool.release_fail(acc, kind)
-            if attempts >= max(3, min(len(pool.snapshot()) or 1, 5)) or not any(a.available() for a in pool.snapshot()):
-                status = 429 if e.kind == "quota" else 502
-                raise HTTPException(status, f"grok error ({e.kind}): {e}")
+            last_err = e
 
 
 # ---------------------------------------------------------------- chat route
