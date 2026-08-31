@@ -367,7 +367,7 @@ def content_to_text(content: Any) -> str:
             if not isinstance(p, dict):
                 continue
             t = p.get("type")
-            if t == "text" and isinstance(p.get("text"), str):
+            if t in ("text", "input_text") and isinstance(p.get("text"), str):
                 parts.append(p["text"])
     return "\n".join(parts)
 
@@ -393,7 +393,7 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
             if not isinstance(p, dict):
                 continue
             t = p.get("type")
-            if t == "text":
+            if t in ("text", "input_text"):
                 new_parts.append(p.get("text", ""))
             elif t == "image_url":
                 url = (p.get("image_url") or {})
@@ -443,19 +443,27 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                                 "attachment download failed (%s): %s", url[:120], e)
             elif t == "input_file" or t == "file":
                 fd = p.get("file") or {}
+                # Chat Completions nests fields under "file"; Responses API
+                # parts carry file_data/file_id/filename at the part top
+                # level (llmcord-go sends {type: "input_file",
+                # file_data: "data:...;base64,...", filename}).
                 name = fd.get("filename") or p.get("filename") or "file"
                 mime = fd.get("mime_type") or p.get("mime_type")
-                if isinstance(fd.get("file_data"), str):
-                    val = fd["file_data"]
-                    if val.startswith("data:"):
-                        try:
-                            data, mime, _ = decode_data_url(val)
-                            file_jobs.append({"name": name, "data": data, "mime": mime})
-                        except UploadError as e:
-                            logging.getLogger("uvicorn.error").warning(
-                                "dropping malformed data-URL file attachment (%s): %s", name, e)
-                elif isinstance(fd.get("file_id"), str):
-                    file_jobs.append({"file_id": fd["file_id"]})
+                file_data = fd.get("file_data")
+                if not isinstance(file_data, str):
+                    file_data = p.get("file_data")
+                file_id = fd.get("file_id")
+                if not isinstance(file_id, str):
+                    file_id = p.get("file_id")
+                if isinstance(file_data, str) and file_data.startswith("data:"):
+                    try:
+                        data, mime, _ = decode_data_url(file_data)
+                        file_jobs.append({"name": name, "data": data, "mime": mime})
+                    except UploadError as e:
+                        logging.getLogger("uvicorn.error").warning(
+                            "dropping malformed data-URL file attachment (%s): %s", name, e)
+                elif isinstance(file_id, str):
+                    file_jobs.append({"file_id": file_id})
                 elif isinstance(p.get("file_url"), str):
                     try:
                         from curl_cffi.requests import AsyncSession as AS
@@ -466,6 +474,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                     except Exception as e:
                         logging.getLogger("uvicorn.error").warning(
                             "attachment download failed (%s): %s", p["file_url"][:120], e)
+                else:
+                    logging.getLogger("uvicorn.error").warning(
+                        "dropping %s part with no usable file_data/file_id/file_url", t)
         out.append({**msg, "content": "\n".join(x for x in new_parts)})
     return out, file_jobs
 
@@ -1410,6 +1421,22 @@ async def responses_api(request: Request):
     await prune_sessions()
 
     messages: list[dict] = []
+
+    def _merge_user_part(content: Any) -> None:
+        """Fold a top-level shorthand item ({input_text}/{input_image}/
+        {input_file}) into the previous user message instead of starting a
+        new one: prompt extraction takes the LAST user message, so a
+        text+image sequence of bare items would otherwise lose its text."""
+        if not (messages and messages[-1].get("role") == "user"):
+            messages.append({"role": "user", "content": [content]})
+            return
+        prev = messages[-1]["content"]
+        if isinstance(prev, str):
+            prev = [{"type": "text", "text": prev}]
+        elif not isinstance(prev, list):
+            prev = []
+        messages[-1]["content"] = prev + [content]
+
     if isinstance(input_data, str):
         messages = [{"role": "user", "content": input_data}]
     elif isinstance(input_data, list):
@@ -1422,9 +1449,9 @@ async def responses_api(request: Request):
                 if itype == "message" or (role and not itype):
                     messages.append({"role": role or "user", "content": item.get("content")})
                 elif itype == "input_text":
-                    messages.append({"role": "user", "content": item.get("text", "")})
+                    _merge_user_part({"type": "text", "text": item.get("text", "")})
                 elif itype in ("input_image", "input_file"):
-                    messages.append({"role": "user", "content": [item]})
+                    _merge_user_part(item)
                 elif role:
                     messages.append(item)
     auth_header = request.headers.get("authorization", "")

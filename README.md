@@ -49,7 +49,9 @@ fail to download are logged instead of vanishing silently.
 Attach images (data URLs, HTTP URLs), text files (inlined into prompt), and binary
 files (uploaded via Grok's presigned upload pipeline). Supported input types:
 - Chat Completions: `image_url`, `file` content parts
-- Responses API: `input_image`, `input_file` items
+- Responses API: message content parts `input_text`, `input_image`,
+  `input_file` (`file_data` data URL or `file_id`, llmcord-go's shape), plus
+  top-level `input_image`/`input_file` items
 
 If every attachment upload fails (e.g. anti-bot gating of grok.com REST), the
 request fails with an upstream error instead of silently sending the prompt
