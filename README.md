@@ -76,6 +76,14 @@ account, and quarantines the offending account for an hour. `/healthz` reports
 the count as `degraded_accounts`. If every attempt lands on a degraded account
 the request surfaces a 502 instead of garbage.
 
+The same degraded gateways also skip image-edit turns: instead of editing the
+attached image they complete the turn with a fresh placeholder generation
+(observed live: "give this cat a hat" + a cat photo answered with an unrelated
+forest path / lighthouse render). `grok_gateway` detects the signature — an
+image output that is not an edit card, with zero reasoning and zero text,
+while attachments were mentioned — and aborts the turn the same way
+(`kind=degraded`), so the request fails over to a healthy account.
+
 ### Show Sources (llmcord-go)
 To feed search citations into `llmcord-go`'s **Show Sources** button:
 - Enable globally by setting `G2O_INCLUDE_SOURCES=1` (or `GROK_INCLUDE_SOURCES=1`) in `.env`.

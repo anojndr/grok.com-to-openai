@@ -121,7 +121,43 @@ async def drive(sess: GrokSession, prompt: str):
     return out
 
 
+def gen_chunk(url: str = "users/uid/generated/abc/final.jpg") -> dict:
+    """Degraded signature: fresh-generation card, no edit of the attachment."""
+    return {"event": {"type": "response.chunk",
+                      "chunk": {"render_generated_image":
+                                {"image_chunk": {"imageUrl": url,
+                                                 "progress": 100}}}}}
+
+
+def edit_chunk(url: str = "users/uid/generated/abc/final.jpg") -> dict:
+    """Healthy edit card: the attached image was actually modified."""
+    return {"event": {"type": "response.chunk",
+                      "chunk": {"render_edited_image":
+                                {"image_chunk": {"imageUrl": url,
+                                                 "progress": 100}}}}}
+
+
+async def drive_attach(sess: GrokSession, prompt: str, attachment_ids=None,
+                       collect: list | None = None):
+    """drive() variant that mentions attachments (image-edit turns).
+
+    When `collect` is given, every event is appended there as it arrives,
+    including any emitted before a GatewayError aborts the turn.
+    """
+    out = []
+    try:
+        async for ev in sess.ask(prompt, attachment_ids=attachment_ids,
+                                 user_text=prompt):
+            out.append(ev)
+            if collect is not None:
+                collect.append(ev)
+    except GatewayError as e:
+        return e
+    return out
+
+
 # -------------------------------------------------------------- detector
+
 
 class UnrelatedQueriesTests(unittest.TestCase):
     USER = "what is the capital of france"
@@ -338,6 +374,116 @@ class FailoverTests(unittest.TestCase):
             server.pool = real_pool
             server.run_session_turn = real_run
         self.assertEqual(ctx.exception.status_code, 502)
+
+
+
+class ImageEditDegradedTests(unittest.TestCase):
+    PROMPT = "give this cat a hat"
+
+    def test_unrelated_generation_with_attachments_aborts(self):
+        # Captured live 2026-08-31: a degraded gateway ignores the attached
+        # image and the prompt, then completes the turn with a placeholder
+        # generation carrying zero reasoning and zero text.
+        frames = [user_item(), gen_chunk(), done_event()]
+        err = asyncio.run(drive_attach(
+            make_scripted_session(frames), self.PROMPT, attachment_ids=["fid"]))
+        self.assertIsInstance(err, GatewayError)
+        self.assertEqual(err.kind, "degraded")
+
+    def test_edited_image_without_reasoning_still_completes(self):
+        # 2026-08-28 incident input B: correct edited image with no visible
+        # text. The edit card is the health signal; missing text must not
+        # fail the turn.
+        frames = [user_item(), edit_chunk(), done_event()]
+        out = asyncio.run(drive_attach(
+            make_scripted_session(frames), self.PROMPT, attachment_ids=["fid"]))
+        self.assertIsInstance(out, list)
+        imgs = [e for e in out if e["type"] == "image_url"]
+        self.assertEqual([e["kind"] for e in imgs], ["edited"])
+        self.assertEqual(out[-1]["type"], "done")
+
+    def test_mixed_edit_and_generated_cards_complete(self):
+        # A turn streaming both an edit card and a generation card is still a
+        # real edit: one "edited" kind exempts every image in the turn, and
+        # kinds stay paired with images in yield order.
+        frames = [user_item(), edit_chunk("users/uid/generated/abc/edit.jpg"),
+                  gen_chunk("users/uid/generated/abc/gen.jpg"), done_event()]
+        out = asyncio.run(drive_attach(
+            make_scripted_session(frames), self.PROMPT, attachment_ids=["fid"]))
+        self.assertIsInstance(out, list)
+        imgs = [e for e in out if e["type"] == "image_url"]
+        self.assertEqual([e["kind"] for e in imgs], ["edited", "generated"])
+        self.assertEqual(out[-1]["type"], "done")
+
+    def test_degraded_abort_emits_no_client_visible_images(self):
+        # Buffering contract: image_url events are held until after the guard,
+        # so a degraded abort reaches the client with nothing rendered and the
+        # streaming failover replays cleanly on a healthy account.
+        frames = [user_item(), gen_chunk(), done_event()]
+        seen: list[dict] = []
+        err = asyncio.run(drive_attach(
+            make_scripted_session(frames), self.PROMPT,
+            attachment_ids=["fid"], collect=seen))
+        self.assertIsInstance(err, GatewayError)
+        self.assertEqual(err.kind, "degraded")
+        self.assertEqual([e for e in seen if e["type"] == "image_url"], [])
+
+    def test_first_seen_url_kind_wins(self):
+        # First-seen-wins labeling (documented on TurnResult.image_kinds): a
+        # URL first surfaced as a generation is never re-labeled "edited" by a
+        # later edit card for the same asset.
+        frames = [user_item(),
+                  gen_chunk("users/uid/generated/abc/dup.jpg"),
+                  edit_chunk("users/uid/generated/abc/dup.jpg"),
+                  done_event()]
+        out = asyncio.run(drive_attach(
+            make_scripted_session(frames), "draw a cat", attachment_ids=None))
+        imgs = [e for e in out if e["type"] == "image_url"]
+        self.assertEqual([e["kind"] for e in imgs], ["generated"])
+
+    def test_reasoning_with_generated_image_completes(self):
+        # The guard requires BOTH zero reasoning and zero text; a turn that
+        # reasons about a generation is a model choice, not a degraded turn.
+        frames = [user_item(),
+                  {"event": {"type": "response.chunk",
+                             "chunk": {"text": {"text": "adding a hat...",
+                                                "channel": "NOTETAKER"}}}},
+                  gen_chunk(), done_event()]
+        out = asyncio.run(drive_attach(
+            make_scripted_session(frames), self.PROMPT, attachment_ids=["fid"]))
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[-1]["type"], "done")
+
+    def test_output_event_generated_image_aborts(self):
+        # Second live image shape: the asset rides response.grok.output
+        # (out.generated_image) instead of a response.chunk card.
+        frames = [user_item(),
+                  {"event": {"type": "response.grok.output",
+                             "output": {"generated_image":
+                                        {"imageUrl": "users/uid/generated/abc/final.jpg"}}}},
+                  done_event()]
+        err = asyncio.run(drive_attach(
+            make_scripted_session(frames), self.PROMPT, attachment_ids=["fid"]))
+        self.assertIsInstance(err, GatewayError)
+        self.assertEqual(err.kind, "degraded")
+
+    def test_fresh_generation_without_attachments_not_flagged(self):
+        # Text-to-image through the gateway legitimately has no edit card.
+        frames = [user_item(), gen_chunk(), done_event()]
+        out = asyncio.run(drive_attach(
+            make_scripted_session(frames), "draw a cat", attachment_ids=None))
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[-1]["type"], "done")
+
+    def test_text_answer_with_rementioned_attachment_not_flagged(self):
+        # Follow-up turns re-mention remembered attachments for context; a
+        # plain text answer must not be treated as a degraded image turn.
+        frames = [user_item(), text_chunk("A tabby, I think."), done_event()]
+        out = asyncio.run(drive_attach(
+            make_scripted_session(frames), "what breed is this?",
+            attachment_ids=["fid"]))
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[-1]["type"], "done")
 
 
 if __name__ == "__main__":

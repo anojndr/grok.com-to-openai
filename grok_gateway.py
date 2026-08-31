@@ -290,6 +290,13 @@ class TurnResult:
     text: str = ""
     reasoning: str = ""
     image_urls: list[str] = field(default_factory=list)
+    # parallel to image_urls: "edited" | "generated" | "unknown".
+    # First-seen-wins: the first card key that surfaces a URL labels it, so a
+    # URL first seen under a generic/generated key is never re-labeled
+    # "edited" by a later edit card. Healthy gateways stream edits under
+    # render_edited_image (live captures 2026-08-31) — the assumption the
+    # degraded-edit guard in ask() rests on.
+    image_kinds: list[str] = field(default_factory=list)
     sources: list[dict] = field(default_factory=list)
     search_queries: list[str] = field(default_factory=list)
     response_id: str = ""
@@ -432,7 +439,7 @@ class GrokSession:
                 await self.ws.send(json.dumps({"session_id": self.conversation_id,
                     "event": {"type": "response.create", "event_id": f"evt_resp_{now_ms}_{new_uuid()[:8]}"}}))
 
-                text, reasoning, images = [], [], []
+                text, reasoning, images, kinds = [], [], [], []
                 tool_queries: list[str] = []   # web_search queries seen this turn
                 sources: list[dict] = []
                 seen_source_urls: set[str] = set()
@@ -481,7 +488,7 @@ class GrokSession:
                         for obj in (out.get("generated_image"), out.get("image")):
                             u = chunk_image_url(obj)
                             if u and u not in images:
-                                images.append(u); yield {"type": "image_url", "url": u}
+                                images.append(u); kinds.append("generated")
                     elif et == "response.chunk":
                         chunk = ev.get("chunk") or {}
                         query = _card_query(chunk.get("tool_usage_card"))
@@ -504,7 +511,9 @@ class GrokSession:
                                     "image", "generatedImage", "media"):
                             u = chunk_image_url(chunk.get(key))
                             if u and u not in images:
-                                images.append(u); yield {"type": "image_url", "url": u}
+                                images.append(u)
+                                kinds.append("edited" if key == "render_edited_image"
+                                             else "generated")
                         if val:
                             if "NOTETAKER" in channel:
                                 reasoning.append(val); yield {"type": "reasoning_delta", "text": val}
@@ -529,12 +538,32 @@ class GrokSession:
                             img_u = _asset_url(match)
                             if img_u not in images:
                                 images.append(img_u)
+                                kinds.append("unknown")
                         result = TurnResult(text=strip_render_tags(raw_text), reasoning="".join(reasoning),
-                            image_urls=images, response_id=response_id or resp.get("id", ""),
+                            image_urls=images, image_kinds=kinds,
+                            response_id=response_id or resp.get("id", ""),
                             sources=sources, search_queries=list(tool_queries),
                             conversation_id=self.conversation_id, parent_response_id=user_msg_id,
                             finish_reason="stop" if status == "completed" else "length")
                         self.last_parent_response_id = result.response_id
+                        if (attachment_ids and images and not "".join(text)
+                                and not "".join(reasoning)
+                                and "edited" not in kinds):
+                            # Degraded gateways intermittently ignore both the
+                            # message and its attachments and complete the turn
+                            # with a fresh placeholder generation (captured live
+                            # 2026-08-31: "give this cat a hat" + a cat photo
+                            # answered by a render_generated_image of an unrelated
+                            # scene with zero reasoning and zero text; healthy
+                            # edits stream render_edited_image). Quarantine and
+                            # fail over like any other degraded turn instead of
+                            # shipping an unrelated image as a successful edit.
+                            raise GatewayError(
+                                "degraded",
+                                "image turn returned a fresh generation unrelated "
+                                "to the request (degraded account)")
+                        for u, k in zip(images, kinds):
+                            yield {"type": "image_url", "url": u, "kind": k}
                         completed_turn = True
                         yield {"type": "done", "result": result, "usage": resp.get("usage") or {}}
                         return
