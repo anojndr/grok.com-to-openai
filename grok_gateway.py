@@ -324,7 +324,7 @@ async def resolve_user_id(cookie_header: str) -> str:
     from curl_cffi.requests import AsyncSession
     async with AsyncSession(impersonate="chrome") as s:
         r = await s.get(f"{GROK_BASE}/api/auth/session",
-                        headers={"user-agent": USER_AGENT, "cookie": cookie_header}, timeout=20)
+                        headers={"user-agent": USER_AGENT, "cookie": cookie_header}, timeout=10)
         if r.status_code == 200:
             try:
                 data = r.json()
@@ -374,7 +374,7 @@ class GrokSession:
         try:
             self.ws = await websockets.connect(uri, additional_headers=headers,
                                                max_size=32 * 1024 * 1024,
-                                               open_timeout=30, close_timeout=10)
+                                               open_timeout=10, close_timeout=5)
             xgrok = default_x_grok()
             if self.conversation_id:
                 xgrok["conversation_id"] = self.conversation_id
@@ -383,7 +383,7 @@ class GrokSession:
                 "session": {"model": self.model_mode, "x_grok": xgrok}}}))
             got_session_id = False
             while not got_session_id:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=30)
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=15)
                 try:
                     env = json.loads(raw)
                 except Exception as e:
@@ -411,10 +411,27 @@ class GrokSession:
                                f"connect failed: {type(e).__name__}: {e}") from e
 
     async def close(self) -> None:
-        if self.ws:
-            try: await self.ws.close()
-            except Exception: pass
+        # Prune and fork race on the live WebSocket: fork moves ws under
+        # source.lock, while prune pops from SESSIONS under SESSION_LOCK.
+        # Close must not race the hand-off, but ask() already holds self.lock
+        # when it calls close() on failure, so avoid deadlock by not
+        # re-acquiring when already locked.
+        if self.lock.locked():
+            ws = self.ws
             self.ws = None
+            if ws:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            return
+        async with self.lock:
+            if self.ws:
+                try:
+                    await self.ws.close()
+                except Exception:
+                    pass
+                self.ws = None
 
     def alive(self) -> bool:
         if self.ws is None: return False
@@ -526,6 +543,15 @@ class GrokSession:
                                              else "generated")
                         if val:
                             if "NOTETAKER" in channel:
+                                # Only the generic placeholder indicates a slow/extra-thinking
+                                # account; legitimate edit reasoning like "adding a hat..."
+                                # must still complete (see
+                                # test_reasoning_with_generated_image_completes).
+                                # Check concatenated buffer to catch placeholder split across two deltas.
+                                if self.model_mode == "fast" and "Thinking about your request" in ("".join(reasoning) + val):
+                                    raise GatewayError(
+                                        "degraded",
+                                        "fast mode produced placeholder reasoning (slow account)")
                                 reasoning.append(val); yield {"type": "reasoning_delta", "text": val}
                             else:
                                 text.append(val); yield {"type": "text_delta", "text": val}
@@ -534,7 +560,12 @@ class GrokSession:
                         if d: text.append(d); yield {"type": "text_delta", "text": d}
                     elif et == "response.reasoning_text.delta":
                         d = ev.get("delta", "")
-                        if d: reasoning.append(d); yield {"type": "reasoning_delta", "text": d}
+                        if d:
+                            if self.model_mode == "fast" and "Thinking about your request" in ("".join(reasoning) + d):
+                                raise GatewayError(
+                                    "degraded",
+                                    "fast mode produced reasoning_text (slow account)")
+                            reasoning.append(d); yield {"type": "reasoning_delta", "text": d}
                     elif et == "conversation.item.added":
                         it = ev.get("item") or {}
                         if it.get("role") == "user": user_msg_id = it.get("id") or user_msg_id

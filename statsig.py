@@ -264,6 +264,7 @@ class StatsigGenerator:
         self._hex: str | None = None
         self._fetched_at = 0.0
         self._lock = asyncio.Lock()
+        self._fetch_task: asyncio.Task | None = None
         self.store = store
         if self.store:
             cached = self.store.get_statsig()
@@ -279,31 +280,64 @@ class StatsigGenerator:
 
     async def ensure_pair(self, fetch_page) -> tuple[str, str]:
         """fetch_page: async callable () -> html text of grok.com/index."""
+        # Fast path without lock
+        if self._hex and time.time() - self._fetched_at < 1800:
+            return self._seed_b64, self._hex
+        # Coalesce concurrent fetches: only one fetch per expiry window
         async with self._lock:
             if self._hex and time.time() - self._fetched_at < 1800:
                 return self._seed_b64, self._hex
-            try:
-                html = await fetch_page()
-                if not html:
-                    return self._seed_b64, self._hex
-                seed_b64 = extract_meta_seed(html)
-                curves = extract_curves(html)
-                if seed_b64 and curves:
-                    seed = base64.b64decode(seed_b64 + "==")
-                    if len(curves) > 0 and len(seed) >= 48:
-                        idx = seed[5] % len(curves)
+            if self._fetch_task is not None and not self._fetch_task.done():
+                task = self._fetch_task
+            else:
+                async def _do_fetch(page=fetch_page):
+                    html = None
+                    try:
+                        html = await page()
+                    except Exception:
+                        html = None
+                    if not html:
+                        return None
+                    seed_b64 = extract_meta_seed(html)
+                    curves = extract_curves(html)
+                    if not (seed_b64 and curves):
+                        return None
+                    try:
+                        seed = base64.b64decode(seed_b64 + "==")
+                    except Exception:
+                        return None
+                    if len(curves) == 0 or len(seed) < 48:
+                        return None
+                    idx = seed[5] % len(curves)
+                    try:
                         path_d = curves_to_path(curves[idx])
                         computed_hex = compute_animation_hex(path_d, seed)
-                        # Atomic state update
+                    except Exception:
+                        return None
+                    async with self._lock:
+                        if self._hex and time.time() - self._fetched_at < 1800:
+                            return self._seed_b64, self._hex
                         self._seed_b64 = seed_b64
                         self._seed_bytes = seed
                         self._hex = computed_hex
                         self._fetched_at = time.time()
                         if self.store:
-                            self.store.set_statsig(seed_b64, computed_hex, self._fetched_at)
-            except Exception:
-                pass
-            return self._seed_b64, self._hex
+                            try:
+                                self.store.set_statsig(seed_b64, computed_hex, self._fetched_at)
+                            except Exception:
+                                pass
+                        return self._seed_b64, self._hex
+                task = asyncio.create_task(_do_fetch())
+                self._fetch_task = task
+        try:
+            result = await task
+        except Exception:
+            result = None
+        # If fetch failed, return stale; if succeeded, task already updated state
+        if result is None:
+            async with self._lock:
+                return self._seed_b64, self._hex
+        return result if isinstance(result, tuple) else (self._seed_b64, self._hex)
 
     def set_pair(self, seed_b64: str, hex_str: str) -> None:
         self._seed_b64 = seed_b64
