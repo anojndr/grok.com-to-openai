@@ -127,8 +127,11 @@ async def prune_sessions() -> None:
             for k, st in sorted_sessions[:excess]:
                 SESSIONS.pop(k, None)
                 to_close.append(st.grok)
-        # Prune sqlite store
+    # Prune sqlite store outside the lock to avoid blocking other requests on disk I/O
+    try:
         store.prune_stale_sessions(SESSION_TTL, MAX_SESSIONS)
+    except Exception:
+        pass
     for g in to_close:
         try:
             await g.close()
@@ -141,50 +144,63 @@ async def get_or_create_session(prefix_key: str | None, users: list[str],
     """Return a session forked from the requested chain checkpoint; the fork
     carries the live WebSocket when the checkpoint had one."""
     uid = await _uid_for(acc)
+    # Fast in-memory check without holding lock during await
+    st: SessionState | None = None
+    need_persist: bool = False
     async with SESSION_LOCK:
         if prefix_key:
             st = SESSIONS.get(prefix_key)
             if st and st.account_key == acc.key and (st.grok.alive() or st.grok.conversation_id):
-                fork = await fork_session_state(st, mode)
-                fork.touch()
-                store.touch_session(prefix_key, fork.last_used)
-                return fork.grok, True
-            # Try restoring from persistent sqlite store
-            if not st:
-                persisted = store.get_session(prefix_key)
-                if persisted and persisted["account_key"] == acc.key:
-                    sess = GrokSession(acc.cookie_header(), uid, mode)
-                    sess.conversation_id = persisted.get("conversation_id", "")
-                    sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
-                    sess.attachments = _clean_attachment_registry(
-                        persisted.get("attachments"))
-                    st = SessionState(
-                        account_key=acc.key,
-                        grok=sess,
-                        user_chain=persisted.get("user_chain", list(users)),
-                        created_at=persisted.get("created_at", time.time()),
-                        last_used=time.time(),
-                    )
-                    SESSIONS[prefix_key] = st
-                    store.touch_session(prefix_key, st.last_used)
-                    fork = await fork_session_state(st, mode)
-                    return fork.grok, True
-        sess = GrokSession(acc.cookie_header(), uid, mode)
-        state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
-        if prefix_key:
-            SESSIONS[prefix_key] = state
-            store.save_session(
-                session_key=prefix_key,
+                # will fork outside lock
+                pass
+            elif not st:
+                need_persist = True
+            else:
+                st = None
+    if st is not None:
+        fork = await fork_session_state(st, mode)
+        fork.touch()
+        store.touch_session(prefix_key, fork.last_used)
+        return fork.grok, True
+    if need_persist and prefix_key:
+        persisted = store.get_session(prefix_key)
+        if persisted and persisted["account_key"] == acc.key:
+            sess = GrokSession(acc.cookie_header(), uid, mode)
+            sess.conversation_id = persisted.get("conversation_id", "")
+            sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+            sess.attachments = _clean_attachment_registry(
+                persisted.get("attachments"))
+            st_new = SessionState(
                 account_key=acc.key,
-                user_chain=list(users),
-                conversation_id=sess.conversation_id,
-                last_parent_response_id=sess.last_parent_response_id,
-                model_mode=mode,
-                attachments=_session_attachments(sess),
-                created_at=state.created_at,
-                last_used=state.last_used,
+                grok=sess,
+                user_chain=persisted.get("user_chain", list(users)),
+                created_at=persisted.get("created_at", time.time()),
+                last_used=time.time(),
             )
-        return sess, False
+            async with SESSION_LOCK:
+                # double-check race
+                if prefix_key not in SESSIONS:
+                    SESSIONS[prefix_key] = st_new
+            store.touch_session(prefix_key, st_new.last_used)
+            fork = await fork_session_state(st_new, mode)
+            return fork.grok, True
+    sess = GrokSession(acc.cookie_header(), uid, mode)
+    state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
+    if prefix_key:
+        async with SESSION_LOCK:
+            SESSIONS[prefix_key] = state
+        store.save_session(
+            session_key=prefix_key,
+            account_key=acc.key,
+            user_chain=list(users),
+            conversation_id=sess.conversation_id,
+            last_parent_response_id=sess.last_parent_response_id,
+            model_mode=mode,
+            attachments=_session_attachments(sess),
+            created_at=state.created_at,
+            last_used=state.last_used,
+        )
+    return sess, False
 
 
 _uid_cache: dict[str, str] = {}
@@ -339,7 +355,7 @@ async def refresh_statsig_pair() -> None:
             # /index 404s; the seed/curves payload lives on the root page.
             r = await s.get(f"{GROK_BASE}/",
                             headers={"user-agent": USER_AGENT, "cookie": cookie},
-                            timeout=30)
+                            timeout=10)
             if r.status_code != 200:
                 # Cloudflare challenge pages carry no meta seed / curves;
                 # feeding them to the extractor silently keeps the pair
@@ -378,8 +394,9 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
     Text-like files are inlined into the prompt text. Images and other binary
     files are returned as jobs for native upload.
     """
-    file_jobs: list[dict] = []   # {name, data, mime}
     out: list[dict] = []
+    ordered_jobs: list[dict | None] = []  # preserves original encounter order
+    pending_downloads: list[dict] = []  # {url, name, mime, ordered_idx}
     for msg in messages:
         content = msg.get("content")
         if isinstance(content, str):
@@ -402,51 +419,42 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                     if val.startswith("data:"):
                         try:
                             data, mime, _ = decode_data_url(val)
-                            file_jobs.append({"name": p.get("name") or "image",
-                                              "data": data, "mime": mime})
+                            ordered_jobs.append({"name": p.get("name") or "image",
+                                                 "data": data, "mime": mime})
                         except UploadError as e:
                             logging.getLogger("uvicorn.error").warning(
                                 "dropping malformed data-URL image attachment: %s", e)
                     elif val.startswith("http"):
-                        try:
-                            from curl_cffi.requests import AsyncSession as AS
-                            async with AS(impersonate="chrome") as s:
-                                dr = await s.get(val, timeout=30)
-                                ct = dr.headers.get("content-type", "image/png").split(";")[0]
-                                file_jobs.append({"name": val.split("?")[0].split("/")[-1] or "image",
-                                                  "data": dr.content, "mime": ct})
-                        except Exception as e:
-                            logging.getLogger("uvicorn.error").warning(
-                                "attachment download failed (%s): %s", val[:120], e)
+                        ordered_jobs.append(None)  # placeholder
+                        pending_downloads.append({
+                            "url": val,
+                            "name": val.split("?")[0].split("/")[-1] or "image",
+                            "mime": None,
+                            "ordered_idx": len(ordered_jobs) - 1,
+                        })
                     else:
                         # grok file id passed through
-                        file_jobs.append({"file_id": val})
+                        ordered_jobs.append({"file_id": val})
             elif t == "input_image":
                 url = p.get("image_url") or p.get("url")
                 if isinstance(url, str):
                     if url.startswith("data:"):
                         try:
                             data, mime, _ = decode_data_url(url)
-                            file_jobs.append({"name": "image", "data": data, "mime": mime})
+                            ordered_jobs.append({"name": "image", "data": data, "mime": mime})
                         except UploadError as e:
                             logging.getLogger("uvicorn.error").warning(
                                 "dropping malformed data-URL image attachment: %s", e)
                     elif url.startswith("http"):
-                        try:
-                            from curl_cffi.requests import AsyncSession as AS
-                            async with AS(impersonate="chrome") as s:
-                                dr = await s.get(url, timeout=30)
-                                ct = dr.headers.get("content-type", "image/png").split(";")[0]
-                                file_jobs.append({"name": "image", "data": dr.content, "mime": ct})
-                        except Exception as e:
-                            logging.getLogger("uvicorn.error").warning(
-                                "attachment download failed (%s): %s", url[:120], e)
+                        ordered_jobs.append(None)
+                        pending_downloads.append({
+                            "url": url,
+                            "name": "image",
+                            "mime": None,
+                            "ordered_idx": len(ordered_jobs) - 1,
+                        })
             elif t == "input_file" or t == "file":
                 fd = p.get("file") or {}
-                # Chat Completions nests fields under "file"; Responses API
-                # parts carry file_data/file_id/filename at the part top
-                # level (llmcord-go sends {type: "input_file",
-                # file_data: "data:...;base64,...", filename}).
                 name = fd.get("filename") or p.get("filename") or "file"
                 mime = fd.get("mime_type") or p.get("mime_type")
                 file_data = fd.get("file_data")
@@ -458,26 +466,48 @@ async def extract_attachments(messages: list[dict]) -> tuple[list[dict], list[di
                 if isinstance(file_data, str) and file_data.startswith("data:"):
                     try:
                         data, mime, _ = decode_data_url(file_data)
-                        file_jobs.append({"name": name, "data": data, "mime": mime})
+                        ordered_jobs.append({"name": name, "data": data, "mime": mime})
                     except UploadError as e:
                         logging.getLogger("uvicorn.error").warning(
                             "dropping malformed data-URL file attachment (%s): %s", name, e)
                 elif isinstance(file_id, str):
-                    file_jobs.append({"file_id": file_id})
+                    ordered_jobs.append({"file_id": file_id})
                 elif isinstance(p.get("file_url"), str):
-                    try:
-                        from curl_cffi.requests import AsyncSession as AS
-                        async with AS(impersonate="chrome") as s:
-                            dr = await s.get(p["file_url"], timeout=30)
-                            file_jobs.append({"name": name, "data": dr.content,
-                                              "mime": mime or dr.headers.get("content-type", "").split(";")[0]})
-                    except Exception as e:
-                        logging.getLogger("uvicorn.error").warning(
-                            "attachment download failed (%s): %s", p["file_url"][:120], e)
+                    ordered_jobs.append(None)
+                    pending_downloads.append({
+                        "url": p["file_url"],
+                        "name": name,
+                        "mime": mime,
+                        "ordered_idx": len(ordered_jobs) - 1,
+                    })
                 else:
                     logging.getLogger("uvicorn.error").warning(
                         "dropping %s part with no usable file_data/file_id/file_url", t)
         out.append({**msg, "content": "\n".join(x for x in new_parts)})
+    # Execute all HTTP downloads concurrently
+    if pending_downloads:
+        from curl_cffi.requests import AsyncSession as AS
+        async def _fetch_one(item: dict):
+            url = item["url"]
+            try:
+                async with AS(impersonate="chrome") as s:
+                    dr = await s.get(url, timeout=30)
+                    ct = dr.headers.get("content-type", "image/png").split(";")[0]
+                    mime = item["mime"] or ct
+                    return {
+                        "ordered_idx": item["ordered_idx"],
+                        "job": {"name": item["name"], "data": dr.content, "mime": mime},
+                        "url": url,
+                    }
+            except Exception as e:
+                logging.getLogger("uvicorn.error").warning(
+                    "attachment download failed (%s): %s", url[:120], e)
+                return {"ordered_idx": item["ordered_idx"], "job": None, "url": url}
+        results = await asyncio.gather(*[_fetch_one(it) for it in pending_downloads])
+        for r in results:
+            idx = r["ordered_idx"]
+            ordered_jobs[idx] = r["job"]
+    file_jobs = [j for j in ordered_jobs if j is not None]
     return out, file_jobs
 
 
@@ -617,44 +647,68 @@ async def stream_session_turn(sess: GrokSession, prompt: str, *,
                 caller_ids.append(fid)
         has_upload_jobs = any("file_id" not in j for j in file_jobs[:6])
         if has_upload_jobs:
-            try:
-                from curl_cffi.requests import AsyncSession as AS
-                await refresh_statsig_pair()
-                async with AS(impersonate="chrome") as s:
-                    for job in file_jobs[:6]:
-                        if "file_id" in job:
-                            continue
-                        name = job.get("name") or "file"
-                        job_hash = _job_hash(job)
-                        if job_hash and known_hashes.get(job_hash):
-                            # Same bytes already uploaded on this account:
-                            # re-mention instead of uploading again. Bump the
-                            # entry to most-recent so both caps keep it.
-                            fid = known_hashes[job_hash]
+            # Preserve original encounter order while parallelizing uploads
+            ordered_ops: list[dict] = []  # {"type": "dedup"/"upload", ...}
+            to_upload: list[tuple[dict, str | None, str, int]] = []  # (job, hash, name, ordered_idx)
+            for job in file_jobs[:6]:
+                if "file_id" in job:
+                    continue
+                name = job.get("name") or "file"
+                job_hash = _job_hash(job)
+                if job_hash and known_hashes.get(job_hash):
+                    ordered_ops.append({"type": "dedup", "fid": known_hashes[job_hash], "hash": job_hash})
+                else:
+                    idx = len(ordered_ops)
+                    ordered_ops.append({"type": "upload", "job": job, "hash": job_hash, "name": name, "idx": idx})
+                    to_upload.append((job, job_hash, name, idx))
+            if to_upload:
+                try:
+                    await refresh_statsig_pair()
+                    async def _upload_one(j: dict, h: str | None, n: str, oi: int):
+                        from curl_cffi.requests import AsyncSession as AS
+                        async with AS(impersonate="chrome") as s:
+                            try:
+                                fm = await upload_file(s, sess.cookie_header, statsig,
+                                                       n, j.get("data") or b"", j.get("mime"))
+                                fid = fm.get("fileMetadataId")
+                                if fid:
+                                    return (oi, fid, h, n, None)
+                                return (oi, None, h, n, "upload returned no fileMetadataId")
+                            except Exception as e:
+                                return (oi, None, h, n, str(e))
+                    results = await asyncio.gather(*[_upload_one(j, h, n, oi) for j, h, n, oi in to_upload])
+                    # Map upload results by ordered_idx for ordered replay
+                    upload_by_idx: dict[int, tuple[str | None, str | None, str, str | None]] = {}
+                    for oi, fid, h, n, err in results:
+                        upload_by_idx[oi] = (fid, h, n, err)
+                    # Replay ops in original encounter order to keep registry/mmention order identical to sequential
+                    for op in ordered_ops:
+                        if op["type"] == "dedup":
+                            fid = op["fid"]
                             _turn_mention(fid)
-                            entry = next((x for x in registry
-                                          if x["file_id"] == fid), None)
+                            entry = next((x for x in registry if x["file_id"] == fid), None)
                             if entry is not None:
-                                registry = [x for x in registry
-                                            if x is not entry] + [entry]
-                            continue
-                        try:
-                            fm = await upload_file(s, sess.cookie_header, statsig,
-                                                   name,
-                                                   job.get("data") or b"",
-                                                   job.get("mime"))
-                        except Exception as e:
-                            upload_errors.append(f"{name}: {e}")
-                            continue
-                        fid = fm.get("fileMetadataId")
-                        if fid:
-                            upload_succeeded = True
-                            _turn_mention(fid)
-                            new_entries.append({"file_id": fid, "hash": job_hash})
+                                registry = [x for x in registry if x is not entry] + [entry]
                         else:
-                            upload_errors.append(f"{name}: upload returned no fileMetadataId")
-            except Exception as e:
-                upload_errors.append(str(e))
+                            oi = op["idx"]
+                            fid, h, n, err = upload_by_idx[oi]
+                            if fid:
+                                upload_succeeded = True
+                                _turn_mention(fid)
+                                new_entries.append({"file_id": fid, "hash": h})
+                            else:
+                                upload_errors.append(f"{n}: {err}")
+                except Exception as e:
+                    upload_errors.append(str(e))
+            else:
+                # Only dedup hits, no real uploads: still need to replay dedups in order
+                for op in ordered_ops:
+                    if op["type"] == "dedup":
+                        fid = op["fid"]
+                        _turn_mention(fid)
+                        entry = next((x for x in registry if x["file_id"] == fid), None)
+                        if entry is not None:
+                            registry = [x for x in registry if x is not entry] + [entry]
             if upload_errors and not upload_succeeded:
                 # Never ship a prompt whose attachments were all dropped: grok
                 # then confidently answers "you didn't attach anything" (the
@@ -754,27 +808,35 @@ async def pick_account_and_stream_turn(session_key: str | None,
         await pool.reload_if_changed()
         if session_key:
             st = None
+            # Check in-memory first without blocking on I/O
             async with SESSION_LOCK:
                 st = SESSIONS.get(session_key)
-                if not st:
-                    persisted = store.get_session(session_key)
-                    if persisted:
-                        acc_cand = next((a for a in pool.snapshot() if a.key == persisted["account_key"]), None)
-                        if acc_cand and acc_cand.available():
-                            uid = await _uid_for(acc_cand)
-                            sess = GrokSession(acc_cand.cookie_header(), uid, mode)
-                            sess.conversation_id = persisted.get("conversation_id", "")
-                            sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
-                            sess.attachments = _clean_attachment_registry(
-                                persisted.get("attachments"))
-                            st = SessionState(
-                                account_key=acc_cand.key,
-                                grok=sess,
-                                user_chain=persisted.get("user_chain", list(users)),
-                                created_at=persisted.get("created_at", time.time()),
-                                last_used=time.time(),
-                            )
-                            SESSIONS[session_key] = st
+            # Restore from SQLite outside the lock to avoid blocking on disk/network
+            if not st:
+                persisted = store.get_session(session_key)
+                if persisted:
+                    acc_cand = next((a for a in pool.snapshot() if a.key == persisted["account_key"]), None)
+                    if acc_cand and acc_cand.available():
+                        uid = await _uid_for(acc_cand)
+                        sess = GrokSession(acc_cand.cookie_header(), uid, mode)
+                        sess.conversation_id = persisted.get("conversation_id", "")
+                        sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+                        sess.attachments = _clean_attachment_registry(
+                            persisted.get("attachments"))
+                        st_new = SessionState(
+                            account_key=acc_cand.key,
+                            grok=sess,
+                            user_chain=persisted.get("user_chain", list(users)),
+                            created_at=persisted.get("created_at", time.time()),
+                            last_used=time.time(),
+                        )
+                        async with SESSION_LOCK:
+                            # double-check race
+                            if session_key not in SESSIONS:
+                                SESSIONS[session_key] = st_new
+                                st = st_new
+                            else:
+                                st = SESSIONS[session_key]
             if st and (st.grok.alive() or st.grok.conversation_id):
                 acc = pool.acquire_by_key(st.account_key)
                 if acc and acc.key not in tried:
@@ -900,10 +962,11 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
         urls: list[str] = []
         try:
             async with websockets.connect(uri, additional_headers=ws_headers,
-                                          max_size=32 * 1024 * 1024) as ws:
+                                          max_size=32 * 1024 * 1024,
+                                          open_timeout=10, close_timeout=5) as ws:
                 await ws.send(json.dumps(msg))
                 while True:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=180)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=60)
                     pat = re.compile(r"https://imagine-public[^" + chr(34) + chr(92) + chr(92) + chr(92) + "s]+")
                     for u in pat.findall(raw):
                         if u not in urls:
@@ -986,8 +1049,9 @@ async def host_images(urls: list[str], cookie: str = "") -> list[str]:
     ``assets.grok.com`` URL to the API client. If PixelVault is not configured
     or hosting fails, log a warning and return available URLs or graceful fallback.
     """
-    hosted: list[str] = []
-    for u in urls[:2]:
+    if not urls:
+        return []
+    async def _host_one(u: str) -> str | None:
         try:
             asset_cookie = _asset_owner_cookie(u, cookie)
             if "assets.grok.com/users/" in u:
@@ -1000,12 +1064,13 @@ async def host_images(urls: list[str], cookie: str = "") -> list[str]:
                     data, mime, name = await _download_asset(u, asset_cookie)
                     info = await pixelvault_upload(data, name, guess_mime(name, mime))
             public_url = info.get("url") if isinstance(info, dict) else None
-            if public_url:
-                hosted.append(public_url)
+            return public_url
         except Exception as e:
             logging.getLogger("uvicorn.error").warning(
                 "image hosting failed for %s: %s", u[:120], e)
-    return hosted
+            return None
+    results = await asyncio.gather(*[_host_one(u) for u in urls[:2]])
+    return [u for u in results if u]
 
 
 
@@ -1026,25 +1091,30 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
             st = None
             async with SESSION_LOCK:
                 st = SESSIONS.get(session_key)
-                if not st:
-                    persisted = store.get_session(session_key)
-                    if persisted:
-                        acc_cand = next((a for a in pool.snapshot() if a.key == persisted["account_key"]), None)
-                        if acc_cand and acc_cand.available():
-                            uid = await _uid_for(acc_cand)
-                            sess = GrokSession(acc_cand.cookie_header(), uid, mode)
-                            sess.conversation_id = persisted.get("conversation_id", "")
-                            sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
-                            sess.attachments = _clean_attachment_registry(
-                                persisted.get("attachments"))
-                            st = SessionState(
-                                account_key=acc_cand.key,
-                                grok=sess,
-                                user_chain=persisted.get("user_chain", list(users)),
-                                created_at=persisted.get("created_at", time.time()),
-                                last_used=time.time(),
-                            )
-                            SESSIONS[session_key] = st
+            if not st:
+                persisted = store.get_session(session_key)
+                if persisted:
+                    acc_cand = next((a for a in pool.snapshot() if a.key == persisted["account_key"]), None)
+                    if acc_cand and acc_cand.available():
+                        uid = await _uid_for(acc_cand)
+                        sess = GrokSession(acc_cand.cookie_header(), uid, mode)
+                        sess.conversation_id = persisted.get("conversation_id", "")
+                        sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+                        sess.attachments = _clean_attachment_registry(
+                            persisted.get("attachments"))
+                        st_new = SessionState(
+                            account_key=acc_cand.key,
+                            grok=sess,
+                            user_chain=persisted.get("user_chain", list(users)),
+                            created_at=persisted.get("created_at", time.time()),
+                            last_used=time.time(),
+                        )
+                        async with SESSION_LOCK:
+                            if session_key not in SESSIONS:
+                                SESSIONS[session_key] = st_new
+                                st = st_new
+                            else:
+                                st = SESSIONS[session_key]
             if st and (st.grok.alive() or st.grok.conversation_id):
                 acc = pool.acquire_by_key(st.account_key)
                 if acc and acc.key not in tried:
@@ -1480,25 +1550,30 @@ async def responses_api(request: Request):
     if prev_resp_id:
         async with SESSION_LOCK:
             sess_prev = SESSIONS.get(prev_resp_id)
-            # Restore from persistent sqlite store when not in memory (e.g. after restart)
-            if not sess_prev:
-                persisted = store.get_session(prev_resp_id)
-                if persisted:
-                    acc_cand = pool.acquire_by_key(persisted["account_key"])
-                    if acc_cand:
-                        sess = GrokSession(acc_cand.cookie_header(), await _uid_for(acc_cand), persisted.get("model_mode", "fast"))
-                        sess.conversation_id = persisted.get("conversation_id", "")
-                        sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
-                        sess.attachments = _clean_attachment_registry(
-                            persisted.get("attachments"))
-                        sess_prev = SessionState(
-                            account_key=acc_cand.key,
-                            grok=sess,
-                            user_chain=persisted.get("user_chain", []),
-                            created_at=persisted.get("created_at", time.time()),
-                            last_used=time.time(),
-                        )
-                        SESSIONS[prev_resp_id] = sess_prev
+        if not sess_prev:
+            persisted = store.get_session(prev_resp_id)
+            if persisted:
+                acc_cand = pool.acquire_by_key(persisted["account_key"])
+                if acc_cand:
+                    uid = await _uid_for(acc_cand)
+                    sess = GrokSession(acc_cand.cookie_header(), uid, persisted.get("model_mode", "fast"))
+                    sess.conversation_id = persisted.get("conversation_id", "")
+                    sess.last_parent_response_id = persisted.get("last_parent_response_id", "")
+                    sess.attachments = _clean_attachment_registry(
+                        persisted.get("attachments"))
+                    sess_new = SessionState(
+                        account_key=acc_cand.key,
+                        grok=sess,
+                        user_chain=persisted.get("user_chain", []),
+                        created_at=persisted.get("created_at", time.time()),
+                        last_used=time.time(),
+                    )
+                    async with SESSION_LOCK:
+                        if prev_resp_id not in SESSIONS:
+                            SESSIONS[prev_resp_id] = sess_new
+                            sess_prev = sess_new
+                        else:
+                            sess_prev = SESSIONS[prev_resp_id]
         if not messages:
             if not sess_prev:
                 raise HTTPException(400, f"unknown previous_response_id: {prev_resp_id}")
