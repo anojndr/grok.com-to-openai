@@ -1,4 +1,5 @@
 """Grok file upload (v2 presigned flow) + PixelVault image hosting."""
+
 from __future__ import annotations
 
 import asyncio
@@ -28,7 +29,9 @@ def guess_mime(filename: str, provided: str | None = None) -> str:
     return guessed or "application/octet-stream"
 
 
-def _sig_headers(statsig: StatsigGenerator | None, path: str, method: str) -> dict[str, str]:
+def _sig_headers(
+    statsig: StatsigGenerator | None, path: str, method: str
+) -> dict[str, str]:
     """x-statsig-id header when the generator holds a seed/hex pair; {} otherwise.
 
     The pair bootstraps from grok.com HTML, which Cloudflare may block; when it
@@ -46,13 +49,13 @@ def _sig_headers(statsig: StatsigGenerator | None, path: str, method: str) -> di
 
 
 async def upload_file(
-    session: AsyncSession,
+    session: AsyncSession[Any],
     acc_cookie: str,
     statsig: StatsigGenerator | None,
     filename: str,
     data: bytes,
     mime: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Upload via /rest/app-chat/upload-file-v2; returns file metadata dict."""
     mime = guess_mime(filename, mime)
     size = len(data)
@@ -67,8 +70,10 @@ async def upload_file(
         f"{GROK_BASE}/rest/app-chat/upload-file-v2/init",
         headers={**headers_base, "content-type": "application/json"},
         json={
-            "fileName": filename, "fileMimeType": mime,
-            "sizeBytes": size, "multipartSupported": False,
+            "fileName": filename,
+            "fileMimeType": mime,
+            "sizeBytes": size,
+            "multipartSupported": False,
         },
         timeout=30,
     )
@@ -113,7 +118,9 @@ async def upload_file(
         }
         sr = await session.get(
             f"{GROK_BASE}/rest/app-chat/upload-file-v2/status",
-            params={"uploadId": upload_id}, headers=st_headers, timeout=15,
+            params={"uploadId": upload_id},
+            headers=st_headers,
+            timeout=15,
         )
         if sr.status_code == 200:
             sj = sr.json()
@@ -136,23 +143,32 @@ def decode_data_url(value: str) -> tuple[bytes, str | None, str]:
     m = DATA_URL_RE.match(value)
     if not m:
         raise UploadError("not a data URL")
-    mime = m.group(1) or "application/octet-stream"
-    payload = value[m.end():]
+    raw_mime = m.group(1)
+    mime: str = (
+        raw_mime
+        if isinstance(raw_mime, str) and raw_mime
+        else "application/octet-stream"
+    )
+    payload = value[m.end() :]
     if "base64" in (m.group(2) or "").lower():
         return base64.b64decode(payload), mime, ""
     from urllib.parse import unquote_to_bytes
+
     return unquote_to_bytes(payload), mime, ""
 
 
 # ------------------------------------------------------------------ PixelVault
 
-async def pixelvault_upload(data: bytes, filename: str = "image.png",
-                            mime: str = "image/png") -> dict[str, Any]:
+
+async def pixelvault_upload(
+    data: bytes, filename: str = "image.png", mime: str = "image/png"
+) -> dict[str, Any]:
     """Upload bytes to PixelVault; returns {'id','url',...}. Raises on failure."""
     if not PIXELVAULT_API_KEY:
         raise UploadError("PIXELVAULT_API_KEY not configured")
     async with AsyncSession(impersonate="chrome") as s:
         from curl_cffi import CurlMime
+
         form = CurlMime()
         form.addpart(name="file", filename=filename, content_type=mime, data=data)
         r = await s.post(
@@ -183,7 +199,13 @@ def validate_public_url(url: str) -> None:
         for entry in addr_info:
             ip_str = entry[4][0]
             ip = ipaddress.ip_address(ip_str)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+            ):
                 raise UploadError(f"SSRF protection: access to {ip_str} is forbidden")
     except socket.gaierror as e:
         raise UploadError(f"DNS resolution failed for {hostname}: {e}")
@@ -197,8 +219,10 @@ async def pixelvault_upload_from_url(url: str) -> dict[str, Any]:
     async with AsyncSession(impersonate="chrome") as s:
         r = await s.post(
             f"{PIXELVAULT_BASE}/v1/images",
-            headers={"Authorization": f"Bearer {PIXELVAULT_API_KEY}",
-                     "content-type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {PIXELVAULT_API_KEY}",
+                "content-type": "application/json",
+            },
             json={"url": url},
             timeout=90,
         )
@@ -218,4 +242,6 @@ async def pixelvault_upload_from_url(url: str) -> dict[str, Any]:
             name = Path(url.split("?")[0]).name or "image"
             return await pixelvault_upload(dr.content, name, ct)
         except Exception as e:
-            raise UploadError(f"pixelvault {r.status_code}: {str(j)[:160]} / download: {e}")
+            raise UploadError(
+                f"pixelvault {r.status_code}: {str(j)[:160]} / download: {e}"
+            )

@@ -16,27 +16,54 @@ sessions resend the role-labeled transcript while continuations keep
 sending only the newest message (user_text stays the newest message for
 degraded-query detection).
 """
+
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
 import unittest
+from collections.abc import AsyncIterator
+from typing import Any, override
 from unittest.mock import AsyncMock, patch
+
+from fastapi import Request
 
 import server
 from accounts import Account, AccountPool
-from grok_gateway import TurnResult, default_x_grok
+from grok_gateway import GrokSession, TurnResult, default_x_grok
 from session_store import SqliteStore
 
 
-class FakeRequest:
-    def __init__(self, body: dict, headers: dict | None = None):
-        self._body = body
-        self.headers = headers or {}
+class FakeRequest(Request):
+    """Real Request carrying a canned JSON body (headers via scope)."""
 
-    async def json(self):
-        return self._body
+    def __init__(
+        self, body: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> None:
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [
+                (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
+            ],
+            "query_string": b"",
+            "server": ("test", 80),
+            "scheme": "http",
+            "client": ("test", 50000),
+        }
+        super().__init__(scope)
+        self._body_data = body
+
+    @override
+    async def json(self) -> Any:
+        return self._body_data
+
+    @override
+    async def body(self) -> bytes:
+        return json.dumps(self._body_data).encode()
 
 
 class GatewayFlagsTests(unittest.TestCase):
@@ -54,7 +81,8 @@ class HistoryPromptTests(unittest.TestCase):
         flat = [{"role": "user", "content": "remember the number 974"}]
         self.assertEqual(
             server.build_history_prompt(flat, "remember the number 974"),
-            "remember the number 974")
+            "remember the number 974",
+        )
 
     def test_followup_transcript_keeps_both_user_messages(self):
         flat = [
@@ -63,7 +91,8 @@ class HistoryPromptTests(unittest.TestCase):
             {"role": "user", "content": "what number did i ask you to remember again?"},
         ]
         prompt = server.build_history_prompt(
-            flat, "what number did i ask you to remember again?")
+            flat, "what number did i ask you to remember again?"
+        )
         self.assertIn("974", prompt)
         self.assertIn("what number did i ask you to remember again?", prompt)
         self.assertIn("User:", prompt)
@@ -81,6 +110,7 @@ class HistoryPromptTests(unittest.TestCase):
 
 
 class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
+    @override
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
         self.store = SqliteStore(os.path.join(self.tmp_dir, "test_store.db"))
@@ -95,7 +125,7 @@ class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
         server.store = self.store
         server.SESSIONS.clear()
         server._uid_cache.clear()
-        self.seen: list[tuple] = []
+        self.seen: list[tuple[Any, ...]] = []
 
     def _pool_with(self, uid: str) -> AccountPool:
         acc = Account(index=1, cookies={"sso": "tok", "x-userid": uid}, user_id=uid)
@@ -106,15 +136,17 @@ class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
 
     def _fake_run(self):
         async def fake_run(sess, prompt, **kwargs):
-            self.seen.append((prompt, kwargs.get("user_text"),
-                              sess.last_parent_response_id))
+            self.seen.append(
+                (prompt, kwargs.get("user_text"), sess.last_parent_response_id)
+            )
             response_id = f"response-{len(self.seen)}"
             sess.conversation_id = sess.conversation_id or "conv-mem"
             sess.last_parent_response_id = response_id
             return TurnResult(text=response_id, response_id=response_id), []
+
         return fake_run
 
-    def _msgs(self, users: list[str]) -> dict:
+    def _msgs(self, users: list[str]) -> dict[str, Any]:
         return {"messages": [{"role": "user", "content": u} for u in users]}
 
     async def test_continuation_sends_only_newest_message(self):
@@ -122,8 +154,10 @@ class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
         self._pool_with("uid-1")
         u1 = "remember the number 974"
         u2 = "what number did i ask you to remember again?"
-        with patch.object(server, "run_session_turn", new=self._fake_run()), \
-             patch.object(server, "refresh_statsig_pair", new=AsyncMock()):
+        with (
+            patch.object(server, "run_session_turn", new=self._fake_run()),
+            patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+        ):
             resp = await server.chat_completions(FakeRequest(self._msgs([u1])))
             self.assertEqual(resp.status_code, 200)
             resp = await server.chat_completions(FakeRequest(self._msgs([u1, u2])))
@@ -139,8 +173,10 @@ class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
         self._pool_with("uid-A")
         u1 = "remember the number 974"
         u2 = "what number did i ask you to remember again?"
-        with patch.object(server, "run_session_turn", new=self._fake_run()), \
-             patch.object(server, "refresh_statsig_pair", new=AsyncMock()):
+        with (
+            patch.object(server, "run_session_turn", new=self._fake_run()),
+            patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+        ):
             resp = await server.chat_completions(FakeRequest(self._msgs([u1])))
             self.assertEqual(resp.status_code, 200)
             # Account A leaves the pool; turn 2 fails over to account B.
@@ -158,23 +194,37 @@ class StreamUserTextTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_turn_forwards_latest_text_for_detection(self):
         from grok_gateway import GatewayError
 
-        calls: list[dict] = []
+        calls: list[dict[str, Any]] = []
 
-        class FakeSess:
-            cookie_header = "ck"
-            attachments: list[dict] = []
-            last_dropped_attachment_ids: set = set()
+        class FakeSess(GrokSession):
+            def __init__(self) -> None:
+                super().__init__("", "", "fast")
+                self.cookie_header = "ck"
+                self.attachments = []
+                self.last_dropped_attachment_ids = set()
 
-            async def ask(self, prompt, *, attachment_ids=None,
-                          system_prompt=None, user_text=""):
+            @override
+            async def ask(
+                self,
+                prompt: str,
+                *,
+                attachment_ids: list[str] | None = None,
+                system_prompt: str | None = None,
+                user_text: str = "",
+                idle_timeout: float = 120.0,
+                max_turn_timeout: float = 300.0,
+            ) -> AsyncIterator[dict[str, Any]]:
                 calls.append({"prompt": prompt, "user_text": user_text})
-                yield {"type": "done", "result": __import__(
-                    "types").SimpleNamespace(text="ok")}
+                yield {
+                    "type": "done",
+                    "result": __import__("types").SimpleNamespace(text="ok"),
+                }
 
         transcript = "User: remember the number 974\n\nUser: what number again?"
         with patch.object(server, "refresh_statsig_pair", new=AsyncMock()):
             await server.run_session_turn(
-                FakeSess(), transcript, user_text="what number again?")
+                FakeSess(), transcript, user_text="what number again?"
+            )
         self.assertEqual(calls[0]["prompt"], transcript)
         self.assertEqual(calls[0]["user_text"], "what number again?")
 

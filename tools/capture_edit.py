@@ -7,51 +7,96 @@ and downloads the produced assets to /tmp/inv/cap_<i>_<j>.<ext>.
 
 Run from the repo root:  python3 tools/capture_edit.py [n_attempts]
 """
+
 import asyncio
 import json
 import sys
 import time
+from collections.abc import AsyncIterable, Iterable
 from pathlib import Path
+from typing import Any, Literal, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import server
 import grok_gateway as gw
-from grok_gateway import GrokSession, GatewayError
+from grok_gateway import GrokSession, GatewayError, TurnResult
 from uploads import upload_file
+from websockets.asyncio.client import ClientConnection
+from websockets.frames import CloseCode
+from websockets.typing import Data, DataLike
 
 OUT = Path("/tmp/inv")
-ATTACH = OUT / "outC.jpg"          # real cat photo, no hat
+ATTACH = OUT / "outC.jpg"  # real cat photo, no hat
 PROMPT = "give this cat a hat"
 
 
-class TeeWS:
+class TeeWS(ClientConnection):
     """Delegating wrapper that records every raw frame to a jsonl file."""
 
-    def __init__(self, ws, path: Path):
-        self._ws = ws
+    def __init__(self, ws: ClientConnection, path: Path) -> None:
+        # Wrap a live connection; delegate protocol state instead of
+        # initialising a fresh sans-I/O protocol.
+        self._ws: ClientConnection = ws
         self._fh = path.open("a", encoding="utf-8")
+        self.protocol = ws.protocol
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         return getattr(self._ws, name)
 
-    async def recv(self):
-        raw = await self._ws.recv()
-        self._log("recv", raw)
+    @overload
+    async def recv(self, decode: Literal[True]) -> str: ...
+
+    @overload
+    async def recv(self, decode: Literal[False]) -> bytes: ...
+
+    @overload
+    async def recv(self, decode: bool | None = None) -> Data: ...
+
+    @override
+    async def recv(self, decode: bool | None = None) -> Data:
+        raw: Data = (
+            await self._ws.recv(decode) if decode is not None else await self._ws.recv()
+        )
+        self._log("recv", raw if isinstance(raw, str) else repr(raw))
         return raw
 
-    async def send(self, raw):
-        self._log("send", raw)
-        return await self._ws.send(raw)
+    @override
+    async def send(
+        self,
+        message: DataLike | Iterable[DataLike] | AsyncIterable[DataLike],
+        *,
+        text: bool | None = None,
+    ) -> None:
+        self._log("send", message if isinstance(message, str) else str(message))
+        if text is not None:
+            await self._ws.send(message, text=text)
+        else:
+            await self._ws.send(message)
+
+    @override
+    async def close(
+        self, code: CloseCode | int = CloseCode.NORMAL_CLOSURE, reason: str = ""
+    ) -> None:
+        try:
+            await self._ws.close(code, reason)
+        finally:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
 
     def _log(self, direction: str, raw: str) -> None:
-        self._fh.write(json.dumps({"t": round(time.time(), 3),
-                                   "dir": direction, "raw": raw}) + "\n")
+        self._fh.write(
+            json.dumps({"t": round(time.time(), 3), "dir": direction, "raw": raw})
+            + "\n"
+        )
         self._fh.flush()
 
 
-async def run_one(i: int, acc_key: str | None = None,
-                  prompt: str = PROMPT, image: Path = ATTACH) -> bool:
+async def run_one(
+    i: int, acc_key: str | None = None, prompt: str = PROMPT, image: Path = ATTACH
+) -> bool:
     await server.pool.reload_if_changed()
     if acc_key:
         acc = next((a for a in server.pool.snapshot() if a.key == acc_key), None)
@@ -76,12 +121,20 @@ async def run_one(i: int, acc_key: str | None = None,
     try:
         sess.user_id = uid
         await sess.connect()
+        assert sess.ws is not None
         sess.ws = TeeWS(sess.ws, frames)
         from curl_cffi.requests import AsyncSession as AS
+
         await server.refresh_statsig_pair()
         async with AS(impersonate="chrome") as s:
-            fm = await upload_file(s, acc.cookie_header(), server.statsig,
-                                   image.name, image.read_bytes(), None)
+            fm = await upload_file(
+                s,
+                acc.cookie_header(),
+                server.statsig,
+                image.name,
+                image.read_bytes(),
+                None,
+            )
         fid = (fm or {}).get("fileMetadataId")
         print(f"[{i}] uploaded file_id={fid}", flush=True)
         if not fid:
@@ -96,9 +149,15 @@ async def run_one(i: int, acc_key: str | None = None,
                 print(f"[{i}] image: {ev.get('url', '')[:110]}", flush=True)
             elif t == "done":
                 res = ev.get("result")
-                print(f"[{i}] done: text={len(res.text)}ch "
-                      f"reasoning={len(res.reasoning)}ch images={len(res.image_urls)}",
-                      flush=True)
+                assert isinstance(res, TurnResult)
+                assert isinstance(res.text, str)
+                assert isinstance(res.reasoning, str)
+                assert isinstance(res.image_urls, list)
+                print(
+                    f"[{i}] done: text={len(res.text)}ch "
+                    f"reasoning={len(res.reasoning)}ch images={len(res.image_urls)}",
+                    flush=True,
+                )
                 images = list(res.image_urls)
         for j, u in enumerate(images):
             try:

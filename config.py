@@ -1,4 +1,5 @@
 """Configuration via environment variables (no secrets hardcoded)."""
+
 import os
 from pathlib import Path
 

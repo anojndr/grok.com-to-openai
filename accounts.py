@@ -4,6 +4,7 @@ accounts.txt format: blocks of Netscape cookie files separated by optional
 `account N:` headers. Each block must contain an `sso` cookie line. The
 `x-userid` cookie (if present) carries the gateway user id.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -16,7 +17,12 @@ from pathlib import Path
 
 BLOCK_SPLIT = re.compile(r"(?m)^account\s+\d+:\s*$")
 INTERESTING_COOKIES = {
-    "sso", "sso-rw", "cf_clearance", "__cf_bm", "x-userid", "grok_device_id",
+    "sso",
+    "sso-rw",
+    "cf_clearance",
+    "__cf_bm",
+    "x-userid",
+    "grok_device_id",
 }
 
 
@@ -31,7 +37,10 @@ class Account:
         uid = self.cookies.get("x-userid", "")
         if uid:
             return "u:" + uid
-        return "s:" + hashlib.sha256(self.cookies.get("sso", "").encode()).hexdigest()[:24]
+        return (
+            "s:" + hashlib.sha256(self.cookies.get("sso", "").encode()).hexdigest()[:24]
+        )
+
     cooldown_until: float = 0.0
     degraded_until: float = 0.0
     in_flight: int = 0
@@ -53,10 +62,13 @@ class Account:
         return "; ".join(f"{k}={v}" for k, v in jar.items())
 
     def available(self) -> bool:
-        return (bool(self.sso) and time.time() >= self.cooldown_until
-                and time.time() >= self.degraded_until)
+        return (
+            bool(self.sso)
+            and time.time() >= self.cooldown_until
+            and time.time() >= self.degraded_until
+        )
 
-    def mark_failed(self, cooldown: int) -> None:
+    def mark_failed(self, cooldown: float) -> None:
         self.failed_requests += 1
         self.cooldown_until = max(self.cooldown_until, time.time() + cooldown)
 
@@ -129,18 +141,21 @@ class AccountPool:
             if not cookies.get("sso"):
                 continue
             n += 1
-            accounts.append(Account(
-                index=n,
-                cookies=cookies,
-                user_id=cookies.get("x-userid", ""),
-            ))
+            accounts.append(
+                Account(
+                    index=n,
+                    cookies=cookies,
+                    user_id=cookies.get("x-userid", ""),
+                )
+            )
         return accounts
 
     def snapshot(self) -> list[Account]:
         return list(self._accounts)
 
-    def acquire(self, exclude: set[str] | None = None,
-                include_degraded: bool = False) -> Account | None:
+    def acquire(
+        self, exclude: set[str] | None = None, include_degraded: bool = False
+    ) -> Account | None:
         """Pick the next account to serve a request.
 
         Round-robins over available accounts, skipping every key in
@@ -165,13 +180,18 @@ class AccountPool:
                 cooling = candidates
             if not cooling:
                 return None
-            acc = min(cooling,
-                      key=lambda a: (max(a.cooldown_until, a.degraded_until), a.index))
+            acc = min(
+                cooling,
+                key=lambda a: (max(a.cooldown_until, a.degraded_until), a.index),
+            )
         acc.total_requests += 1
         if self.store:
             self.store.save_account_state(
-                acc.key, acc.cooldown_until, acc.degraded_until,
-                acc.total_requests, acc.failed_requests,
+                acc.key,
+                acc.cooldown_until,
+                acc.degraded_until,
+                acc.total_requests,
+                acc.failed_requests,
             )
         return acc
 
@@ -181,8 +201,11 @@ class AccountPool:
             acc.total_requests += 1
             if self.store:
                 self.store.save_account_state(
-                    acc.key, acc.cooldown_until, acc.degraded_until,
-                    acc.total_requests, acc.failed_requests,
+                    acc.key,
+                    acc.cooldown_until,
+                    acc.degraded_until,
+                    acc.total_requests,
+                    acc.failed_requests,
                 )
             return acc
         return None
@@ -191,8 +214,11 @@ class AccountPool:
         acc.cooldown_until = 0.0
         if self.store:
             self.store.save_account_state(
-                acc.key, acc.cooldown_until, acc.degraded_until,
-                acc.total_requests, acc.failed_requests,
+                acc.key,
+                acc.cooldown_until,
+                acc.degraded_until,
+                acc.total_requests,
+                acc.failed_requests,
             )
 
     def release_fail(self, acc: Account, kind: str = "generic") -> None:
@@ -214,6 +240,9 @@ class AccountPool:
         acc.mark_failed(cooldown)
         if self.store:
             self.store.save_account_state(
-                acc.key, acc.cooldown_until, acc.degraded_until,
-                acc.total_requests, acc.failed_requests,
+                acc.key,
+                acc.cooldown_until,
+                acc.degraded_until,
+                acc.total_requests,
+                acc.failed_requests,
             )

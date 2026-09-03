@@ -1,30 +1,53 @@
 """Tests for real real-time streaming in grok-to-openai-api."""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import time
 import unittest
+from typing import Any, override
 from unittest.mock import AsyncMock, patch
+
+from fastapi import Request
 
 import server
 from accounts import Account, AccountPool
 from grok_gateway import GrokSession, TurnResult, RenderFilter
 
 
-class FakeRequest:
-    def __init__(self, body: dict):
-        self._body = body
-        self.headers = {}
+class FakeRequest(Request):
+    """Real Request carrying a canned JSON body."""
 
-    async def json(self):
-        return self._body
+    def __init__(self, body: dict[str, Any]) -> None:
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [],
+            "query_string": b"",
+            "server": ("test", 80),
+            "scheme": "http",
+            "client": ("test", 50000),
+        }
+        super().__init__(scope)
+        self._body_data = body
+
+    @override
+    async def json(self) -> Any:
+        return self._body_data
+
+    @override
+    async def body(self) -> bytes:
+        return json.dumps(self._body_data).encode()
 
 
 class RealStreamingTest(unittest.IsolatedAsyncioTestCase):
+    @override
     def setUp(self):
         server.SESSIONS.clear()
 
+    @override
     def tearDown(self):
         server.SESSIONS.clear()
 
@@ -33,13 +56,20 @@ class RealStreamingTest(unittest.IsolatedAsyncioTestCase):
         deltas = ["Hello", " world", " from", " real", " stream!"]
         delays = [0.05, 0.05, 0.05, 0.05, 0.05]
 
-        fake_acc = Account(index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1")
+        fake_acc = Account(
+            index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1"
+        )
         fake_state = server.SessionState(account_key=fake_acc.key, grok=AsyncMock())
 
         async def fake_stream_turn(*args, **kwargs):
             for d, delay in zip(deltas, delays):
                 await asyncio.sleep(delay)
-                yield {"type": "text_delta", "text": d, "acc": fake_acc, "state": fake_state}
+                yield {
+                    "type": "text_delta",
+                    "text": d,
+                    "acc": fake_acc,
+                    "state": fake_state,
+                }
             yield {
                 "type": "done",
                 "result": TurnResult(text="Hello world from real stream!"),
@@ -53,11 +83,13 @@ class RealStreamingTest(unittest.IsolatedAsyncioTestCase):
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        with patch("server.pick_account_and_stream_turn", fake_stream_turn), \
-             patch("server.refresh_statsig_pair", new=AsyncMock()):
+        with (
+            patch("server.pick_account_and_stream_turn", fake_stream_turn),
+            patch("server.refresh_statsig_pair", new=AsyncMock()),
+        ):
             start_time = time.time()
             resp = await server.chat_completions(FakeRequest(body))
-            
+
             chunk_times = []
             collected_deltas = []
             async for chunk in resp.body_iterator:
@@ -65,8 +97,12 @@ class RealStreamingTest(unittest.IsolatedAsyncioTestCase):
                 for line in chunk.split("\n"):
                     if line.startswith("data: ") and line != "data: [DONE]":
                         payload = json.loads(line[6:])
-                        if payload.get("choices") and payload["choices"][0].get("delta", {}).get("content"):
-                            collected_deltas.append(payload["choices"][0]["delta"]["content"])
+                        if payload.get("choices") and payload["choices"][0].get(
+                            "delta", {}
+                        ).get("content"):
+                            collected_deltas.append(
+                                payload["choices"][0]["delta"]["content"]
+                            )
                             chunk_times.append(t - start_time)
 
         self.assertEqual(collected_deltas, deltas)
@@ -82,13 +118,20 @@ class RealStreamingTest(unittest.IsolatedAsyncioTestCase):
         deltas = ["Responding", " in", " real", " time!"]
         delays = [0.05, 0.05, 0.05, 0.05]
 
-        fake_acc = Account(index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1")
+        fake_acc = Account(
+            index=1, cookies={"sso": "tok", "x-userid": "uid-1"}, user_id="uid-1"
+        )
         fake_state = server.SessionState(account_key=fake_acc.key, grok=AsyncMock())
 
         async def fake_stream_turn(*args, **kwargs):
             for d, delay in zip(deltas, delays):
                 await asyncio.sleep(delay)
-                yield {"type": "text_delta", "text": d, "acc": fake_acc, "state": fake_state}
+                yield {
+                    "type": "text_delta",
+                    "text": d,
+                    "acc": fake_acc,
+                    "state": fake_state,
+                }
             yield {
                 "type": "done",
                 "result": TurnResult(text="Responding in real time!"),
@@ -102,8 +145,10 @@ class RealStreamingTest(unittest.IsolatedAsyncioTestCase):
             "input": "test prompt",
         }
 
-        with patch("server.pick_account_and_stream_turn", fake_stream_turn), \
-             patch("server.refresh_statsig_pair", new=AsyncMock()):
+        with (
+            patch("server.pick_account_and_stream_turn", fake_stream_turn),
+            patch("server.refresh_statsig_pair", new=AsyncMock()),
+        ):
             start_time = time.time()
             resp = await server.responses_api(FakeRequest(body))
 

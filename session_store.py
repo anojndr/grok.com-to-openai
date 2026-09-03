@@ -6,6 +6,7 @@ Persists:
   - Cached user_ids per account index/sso hash.
   - Statsig seed and animation hex pairs.
 """
+
 from __future__ import annotations
 
 import json
@@ -57,16 +58,17 @@ CREATE TABLE IF NOT EXISTS statsig_cache (
 MAX_TRACKED_ATTACHMENTS = 12
 
 
-def clean_attachment_rows(raw: Any) -> list[dict]:
+def clean_attachment_rows(raw: Any) -> list[dict[str, Any]]:
     """Canonicalize stored attachment rows: shape-checked, hash coerced, capped."""
     if not isinstance(raw, list):
         return []
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for e in raw:
         if isinstance(e, dict) and isinstance(e.get("file_id"), str) and e["file_id"]:
             h = e.get("hash")
-            out.append({"file_id": e["file_id"],
-                        "hash": h if isinstance(h, str) else None})
+            out.append(
+                {"file_id": e["file_id"], "hash": h if isinstance(h, str) else None}
+            )
     return out[-MAX_TRACKED_ATTACHMENTS:]
 
 
@@ -75,11 +77,12 @@ class SqliteStore:
         self.path = Path(db_path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = __import__("threading").Lock()
-        self._conn = None
+        self._conn: sqlite3.Connection | None = None
         self._connect()
 
     def _connect(self) -> None:
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        assert self._conn is not None
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -93,29 +96,34 @@ class SqliteStore:
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)")}
         if "attachments_json" not in cols:
             self._conn.execute(
-                "ALTER TABLE sessions ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'")
+                "ALTER TABLE sessions ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'"
+            )
             self._conn.commit()
 
     def _execute(self, sql: str, params=()) -> sqlite3.Cursor:
         with self._lock:
+            assert self._conn is not None
             try:
                 cur = self._conn.execute(sql, params)
                 self._conn.commit()
                 return cur
             except sqlite3.OperationalError:
                 self._connect()
+                assert self._conn is not None
                 cur = self._conn.execute(sql, params)
                 self._conn.commit()
                 return cur
 
     # ----------------------------------------------------------- sessions
 
-    def get_session(self, session_key: str) -> dict | None:
-        cur = self._execute("SELECT * FROM sessions WHERE session_key = ?", (session_key,))
+    def get_session(self, session_key: str) -> dict[str, Any] | None:
+        cur = self._execute(
+            "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
+        )
         row = cur.fetchone()
         if row is None:
             return None
-        d = dict(row)
+        d: dict[str, Any] = dict(row)
         try:
             d["user_chain"] = json.loads(d.get("user_chain_json") or "[]")
         except Exception:
@@ -127,21 +135,45 @@ class SqliteStore:
         d["attachments"] = clean_attachment_rows(raw)
         return d
 
-    def save_session(self, session_key: str, account_key: str, user_chain: list[str],
-                     conversation_id: str = "", last_parent_response_id: str = "",
-                     model_mode: str = "fast", created_at: float | None = None,
-                     last_used: float | None = None,
-                     attachments: list[dict] | None = None) -> None:
+    def save_session(
+        self,
+        session_key: str,
+        account_key: str,
+        user_chain: list[str],
+        conversation_id: str = "",
+        last_parent_response_id: str = "",
+        model_mode: str = "fast",
+        created_at: float | None = None,
+        last_used: float | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
         now = time.time()
         created_at = float(created_at) if isinstance(created_at, (int, float)) else now
         last_used = float(last_used) if isinstance(last_used, (int, float)) else now
         session_key = str(session_key) if session_key is not None else ""
         account_key = str(account_key) if account_key is not None else ""
-        conversation_id = str(conversation_id) if isinstance(conversation_id, str) else (getattr(conversation_id, "conversation_id", "") if not hasattr(conversation_id, "assert_called") else "")
-        last_parent_response_id = str(last_parent_response_id) if isinstance(last_parent_response_id, str) else ""
+        conversation_id = (
+            str(conversation_id)
+            if isinstance(conversation_id, str)
+            else (
+                getattr(conversation_id, "conversation_id", "")
+                if not hasattr(conversation_id, "assert_called")
+                else ""
+            )
+        )
+        last_parent_response_id = (
+            str(last_parent_response_id)
+            if isinstance(last_parent_response_id, str)
+            else ""
+        )
         model_mode = str(model_mode) if isinstance(model_mode, str) else "fast"
         if not isinstance(user_chain, list):
-            user_chain = list(user_chain) if hasattr(user_chain, "__iter__") and not isinstance(user_chain, (str, bytes)) else []
+            user_chain = (
+                list(user_chain)
+                if hasattr(user_chain, "__iter__")
+                and not isinstance(user_chain, (str, bytes))
+                else []
+            )
         clean_chain = [str(u) for u in user_chain if isinstance(u, str)]
         user_chain_json = json.dumps(clean_chain, ensure_ascii=False)
         if attachments is None:
@@ -154,23 +186,45 @@ class SqliteStore:
                 "(session_key, account_key, user_chain_json, conversation_id, last_parent_response_id, model_mode, attachments_json, created_at, last_used) "
                 "VALUES (?, ?, ?, ?, ?, ?, "
                 "COALESCE((SELECT attachments_json FROM sessions WHERE session_key = ?), '[]'), ?, ?)",
-                (session_key, account_key, user_chain_json, conversation_id,
-                 last_parent_response_id, model_mode, session_key,
-                 created_at, last_used),
+                (
+                    session_key,
+                    account_key,
+                    user_chain_json,
+                    conversation_id,
+                    last_parent_response_id,
+                    model_mode,
+                    session_key,
+                    created_at,
+                    last_used,
+                ),
             )
             return
-        attachments_json = json.dumps(clean_attachment_rows(attachments), ensure_ascii=False)
+        attachments_json = json.dumps(
+            clean_attachment_rows(attachments), ensure_ascii=False
+        )
         self._execute(
             "INSERT OR REPLACE INTO sessions "
             "(session_key, account_key, user_chain_json, conversation_id, last_parent_response_id, model_mode, attachments_json, created_at, last_used) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_key, account_key, user_chain_json, conversation_id,
-             last_parent_response_id, model_mode, attachments_json, created_at, last_used),
+            (
+                session_key,
+                account_key,
+                user_chain_json,
+                conversation_id,
+                last_parent_response_id,
+                model_mode,
+                attachments_json,
+                created_at,
+                last_used,
+            ),
         )
 
     def touch_session(self, session_key: str, last_used: float | None = None) -> None:
         now = last_used or time.time()
-        self._execute("UPDATE sessions SET last_used = ? WHERE session_key = ?", (now, session_key))
+        self._execute(
+            "UPDATE sessions SET last_used = ? WHERE session_key = ?",
+            (now, session_key),
+        )
 
     def delete_session(self, session_key: str) -> None:
         self._execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
@@ -179,20 +233,25 @@ class SqliteStore:
         if not session_keys:
             return
         placeholders = ",".join("?" for _ in session_keys)
-        self._execute(f"DELETE FROM sessions WHERE session_key IN ({placeholders})", tuple(session_keys))
+        self._execute(
+            f"DELETE FROM sessions WHERE session_key IN ({placeholders})",
+            tuple(session_keys),
+        )
 
-    def load_all_sessions(self, ttl: float | None = None) -> dict[str, dict]:
+    def load_all_sessions(self, ttl: float | None = None) -> dict[str, dict[str, Any]]:
         """Load valid non-expired sessions from DB."""
         now = time.time()
         if ttl:
             cutoff = now - ttl
-            cur = self._execute("SELECT * FROM sessions WHERE last_used >= ?", (cutoff,))
+            cur = self._execute(
+                "SELECT * FROM sessions WHERE last_used >= ?", (cutoff,)
+            )
         else:
             cur = self._execute("SELECT * FROM sessions")
         rows = cur.fetchall()
-        out = {}
+        out: dict[str, dict[str, Any]] = {}
         for r in rows:
-            d = dict(r)
+            d: dict[str, Any] = dict(r)
             try:
                 d["user_chain"] = json.loads(d.get("user_chain_json") or "[]")
             except Exception:
@@ -204,47 +263,77 @@ class SqliteStore:
         """Prune sessions older than TTL and excess sessions beyond max_sessions. Returns pruned session keys."""
         now = time.time()
         cutoff = now - ttl
-        cur = self._execute("SELECT session_key FROM sessions WHERE last_used < ?", (cutoff,))
-        stale_keys = [r["session_key"] for r in cur.fetchall()]
+        cur = self._execute(
+            "SELECT session_key FROM sessions WHERE last_used < ?", (cutoff,)
+        )
+        stale_keys: list[str] = [
+            r["session_key"]
+            for r in cur.fetchall()
+            if isinstance(r["session_key"], str)
+        ]
         if stale_keys:
             self.delete_sessions(stale_keys)
 
         cur = self._execute("SELECT session_key FROM sessions ORDER BY last_used ASC")
-        all_keys = [r["session_key"] for r in cur.fetchall()]
+        all_keys: list[str] = [
+            r["session_key"]
+            for r in cur.fetchall()
+            if isinstance(r["session_key"], str)
+        ]
         if len(all_keys) > max_sessions:
-            excess_keys = all_keys[:len(all_keys) - max_sessions]
+            excess_keys = all_keys[: len(all_keys) - max_sessions]
             self.delete_sessions(excess_keys)
             stale_keys.extend(excess_keys)
         return stale_keys
 
     # ----------------------------------------------------- account states
 
-    def get_account_state(self, account_key: str) -> dict | None:
-        cur = self._execute("SELECT * FROM account_states WHERE account_key = ?", (account_key,))
+    def get_account_state(self, account_key: str) -> dict[str, Any] | None:
+        cur = self._execute(
+            "SELECT * FROM account_states WHERE account_key = ?", (account_key,)
+        )
         row = cur.fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        d: dict[str, Any] = dict(row)
+        return d
 
-    def get_all_account_states(self) -> dict[str, dict]:
+    def get_all_account_states(self) -> dict[str, dict[str, Any]]:
         cur = self._execute("SELECT * FROM account_states")
         return {r["account_key"]: dict(r) for r in cur.fetchall()}
 
-    def save_account_state(self, account_key: str, cooldown_until: float,
-                           degraded_until: float, total_requests: int,
-                           failed_requests: int) -> None:
+    def save_account_state(
+        self,
+        account_key: str,
+        cooldown_until: float,
+        degraded_until: float,
+        total_requests: int,
+        failed_requests: int,
+    ) -> None:
         now = time.time()
         self._execute(
             "INSERT OR REPLACE INTO account_states "
             "(account_key, cooldown_until, degraded_until, total_requests, failed_requests, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (account_key, cooldown_until, degraded_until, total_requests, failed_requests, now),
+            (
+                account_key,
+                cooldown_until,
+                degraded_until,
+                total_requests,
+                failed_requests,
+                now,
+            ),
         )
 
-    # ---------------------------------------------------------- uid cache
-
     def get_uid(self, account_key: str) -> str | None:
-        cur = self._execute("SELECT user_id FROM uid_cache WHERE account_key = ?", (account_key,))
+        cur = self._execute(
+            "SELECT user_id FROM uid_cache WHERE account_key = ?", (account_key,)
+        )
         row = cur.fetchone()
-        return row["user_id"] if row else None
+        if row is None:
+            return None
+        val = row["user_id"]
+        return val if isinstance(val, str) else None
 
     def get_all_uids(self) -> dict[str, str]:
         cur = self._execute("SELECT account_key, user_id FROM uid_cache")
@@ -260,13 +349,24 @@ class SqliteStore:
     # ------------------------------------------------------ statsig cache
 
     def get_statsig(self) -> tuple[str, str, float] | None:
-        cur = self._execute("SELECT seed_b64, hex_str, fetched_at FROM statsig_cache WHERE id = 1")
+        cur = self._execute(
+            "SELECT seed_b64, hex_str, fetched_at FROM statsig_cache WHERE id = 1"
+        )
         row = cur.fetchone()
-        if row:
-            return row["seed_b64"], row["hex_str"], row["fetched_at"]
-        return None
+        if row is None:
+            return None
+        seed = row["seed_b64"]
+        hex_str = row["hex_str"]
+        fetched = row["fetched_at"]
+        if not isinstance(seed, str) or not isinstance(hex_str, str):
+            return None
+        if not isinstance(fetched, (int, float)):
+            return None
+        return seed, hex_str, float(fetched)
 
-    def set_statsig(self, seed_b64: str, hex_str: str, fetched_at: float | None = None) -> None:
+    def set_statsig(
+        self, seed_b64: str, hex_str: str, fetched_at: float | None = None
+    ) -> None:
         now = fetched_at or time.time()
         self._execute(
             "INSERT OR REPLACE INTO statsig_cache (id, seed_b64, hex_str, fetched_at) VALUES (1, ?, ?, ?)",

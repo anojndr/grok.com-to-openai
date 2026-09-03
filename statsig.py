@@ -18,6 +18,7 @@ emulate the WebAnimation/getComputedStyle fingerprint, and hex-encode.
 
 The active (seed, HEX) pair auto-refreshes from https://grok.com/index.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +30,8 @@ import os
 import re
 import struct
 import time
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 STATSIG_EPOCH = 1682924400  # 0x644f6370
 SALT = "obfiowerehiring"
@@ -36,6 +39,7 @@ MARK = 0x03
 
 
 # ---------------------------------------------------------------- hex helpers
+
 
 def js_round(x: float) -> int:
     """JS Math.round() rounds half towards positive infinity (e.g. 2.5 -> 3, -2.5 -> -2)."""
@@ -69,8 +73,8 @@ def js_num_to_hex(v: float) -> str:
 
 
 def js_to_fixed(v: float, prec: int = 2) -> float:
-    p = 10 ** prec
-    return js_round(v * p) / p
+    p: int = int(10**prec)
+    return float(js_round(v * p)) / float(p)
 
 
 def _sample_cubic(t: float, a1: float, a2: float) -> float:
@@ -157,11 +161,11 @@ def compute_animation_hex(svg_path_d: str, seed: bytes) -> str:
     return re.sub(r"[.\-]", "", buf)
 
 
-def curves_to_path(curve_segs: list[dict]) -> str:
+def curves_to_path(curve_segs: list[dict[str, Any]]) -> str:
     pieces = [
-        f' {e["color"][0]},{e["color"][1]} {e["color"][2]},{e["color"][3]} '
-        f'{e["color"][4]},{e["color"][5]} h {e["deg"]} s '
-        f'{e["bezier"][0]},{e["bezier"][1]} {e["bezier"][2]},{e["bezier"][3]}'
+        f" {e['color'][0]},{e['color'][1]} {e['color'][2]},{e['color'][3]} "
+        f"{e['color'][4]},{e['color'][5]} h {e['deg']} s "
+        f"{e['bezier'][0]},{e['bezier'][1]} {e['bezier'][2]},{e['bezier'][3]}"
         for e in curve_segs
     ]
     return "M 10,30 C" + " C".join(pieces)
@@ -169,21 +173,27 @@ def curves_to_path(curve_segs: list[dict]) -> str:
 
 # ------------------------------------------------------------ html extraction
 
+
 def extract_meta_seed(html: str) -> str | None:
     # meta name uses a unicode dash; normalize any dash variant
     m = re.search(
         r'<meta[^>]*name=["\']grok[‐‑‒–—―-]site[‐‑‒–—―-]verification["\'][^>]*content=["\']([^"\']+)["\']',
-        html, re.I,
+        html,
+        re.I,
     )
     if not m:
         m = re.search(
             r'content=["\']([^"\']+)["\'][^>]*name=["\']grok[‐‑‒–—―-]site[‐‑‒–—―-]verification["\']',
-            html, re.I,
+            html,
+            re.I,
         )
-    return m.group(1) if m else None
+    if not m:
+        return None
+    val = m.group(1)
+    return val if isinstance(val, str) else None
 
 
-def extract_curves(html: str) -> list | None:
+def extract_curves(html: str) -> list[Any] | None:
     marker = '\\"curves\\":['
     i = html.find(marker)
     escaped = True
@@ -224,7 +234,7 @@ def extract_curves(html: str) -> list | None:
                 if not depth:
                     break
         j += 1
-    raw = blob[start:j + 1]
+    raw = blob[start : j + 1]
     d2 = 0
     end = None
     in2 = False
@@ -254,8 +264,8 @@ def extract_curves(html: str) -> list | None:
         return None
 
 
-
 # ------------------------------------------------------------------ generator
+
 
 class StatsigGenerator:
     def __init__(self, store=None):
@@ -264,7 +274,7 @@ class StatsigGenerator:
         self._hex: str | None = None
         self._fetched_at = 0.0
         self._lock = asyncio.Lock()
-        self._fetch_task: asyncio.Task | None = None
+        self._fetch_task: asyncio.Task[tuple[str, str] | None] | None = None
         self.store = store
         if self.store:
             cached = self.store.get_statsig()
@@ -278,20 +288,31 @@ class StatsigGenerator:
                 self._hex = h_str
                 self._fetched_at = f_at
 
-    async def ensure_pair(self, fetch_page) -> tuple[str, str]:
+    async def ensure_pair(
+        self, fetch_page: Callable[[], Awaitable[str | None]]
+    ) -> tuple[str, str]:
         """fetch_page: async callable () -> html text of grok.com/index."""
         # Fast path without lock
         if self._hex and time.time() - self._fetched_at < 1800:
-            return self._seed_b64, self._hex
+            seed_b64 = self._seed_b64
+            hex_ = self._hex
+            if seed_b64 and hex_:
+                return seed_b64, hex_
         # Coalesce concurrent fetches: only one fetch per expiry window
         async with self._lock:
             if self._hex and time.time() - self._fetched_at < 1800:
-                return self._seed_b64, self._hex
+                seed_b64 = self._seed_b64
+                hex_ = self._hex
+                if seed_b64 and hex_:
+                    return seed_b64, hex_
             if self._fetch_task is not None and not self._fetch_task.done():
                 task = self._fetch_task
             else:
-                async def _do_fetch(page=fetch_page):
-                    html = None
+
+                async def _do_fetch(
+                    page: Callable[[], Awaitable[str | None]] = fetch_page,
+                ) -> tuple[str, str] | None:
+                    html: str | None = None
                     try:
                         html = await page()
                     except Exception:
@@ -316,17 +337,23 @@ class StatsigGenerator:
                         return None
                     async with self._lock:
                         if self._hex and time.time() - self._fetched_at < 1800:
-                            return self._seed_b64, self._hex
+                            seed_b64_cached = self._seed_b64
+                            hex_cached = self._hex
+                            if seed_b64_cached and hex_cached:
+                                return seed_b64_cached, hex_cached
                         self._seed_b64 = seed_b64
                         self._seed_bytes = seed
                         self._hex = computed_hex
                         self._fetched_at = time.time()
                         if self.store:
                             try:
-                                self.store.set_statsig(seed_b64, computed_hex, self._fetched_at)
+                                self.store.set_statsig(
+                                    seed_b64, computed_hex, self._fetched_at
+                                )
                             except Exception:
                                 pass
-                        return self._seed_b64, self._hex
+                        return seed_b64, computed_hex
+
                 task = asyncio.create_task(_do_fetch())
                 self._fetch_task = task
         try:
@@ -336,8 +363,12 @@ class StatsigGenerator:
         # If fetch failed, return stale; if succeeded, task already updated state
         if result is None:
             async with self._lock:
-                return self._seed_b64, self._hex
-        return result if isinstance(result, tuple) else (self._seed_b64, self._hex)
+                seed_b64 = self._seed_b64
+                hex_ = self._hex
+                if seed_b64 and hex_:
+                    return seed_b64, hex_
+                return "", ""
+        return result
 
     def set_pair(self, seed_b64: str, hex_str: str) -> None:
         self._seed_b64 = seed_b64
