@@ -8,23 +8,23 @@ Run: python3 -m unittest -v tests.test_include_sources
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import unittest
 from collections.abc import AsyncIterable, Iterable
 from types import SimpleNamespace
-from typing import Any, Literal, overload, override
+from typing import Any, ClassVar, Literal, overload, override
 from unittest.mock import AsyncMock, patch
 
-import server
-from accounts import Account
 from fastapi import Request
-from grok_gateway import GrokSession, TurnResult, extract_web_results
 from websockets.asyncio.client import ClientConnection
 from websockets.frames import CloseCode
 from websockets.protocol import State
 from websockets.typing import Data, DataLike
+
+import server
+from accounts import Account
+from grok_gateway import GrokSession, TurnResult, extract_web_results
 
 SOURCES = [
     {"url": "https://example.com/news", "title": "Example News"},
@@ -140,6 +140,7 @@ class IncludeSourcesFlagTest(unittest.TestCase):
     def test_env_var_grok_include_sources_fallback(self):
         import importlib
         import os
+
         import config
 
         with patch.dict(os.environ, {"GROK_INCLUDE_SOURCES": "1"}, clear=False):
@@ -164,7 +165,7 @@ class IncludeSourcesFlagTest(unittest.TestCase):
 
 
 class WebSourcesExtractionTest(unittest.TestCase):
-    EVENT_SEARCH = {
+    EVENT_SEARCH: ClassVar[dict[str, Any]] = {
         "event": {"type": "response.search.result"},
         "result": {
             "search_type": "web_search",
@@ -172,7 +173,7 @@ class WebSourcesExtractionTest(unittest.TestCase):
         },
     }
 
-    EVENT_TOOL = {
+    EVENT_TOOL: ClassVar[dict[str, Any]] = {
         "event": {"type": "response.grok.output"},
         "output": {
             "tool_result": {
@@ -181,7 +182,7 @@ class WebSourcesExtractionTest(unittest.TestCase):
         },
     }
 
-    EVENT_CHUNK = {
+    EVENT_CHUNK: ClassVar[dict[str, Any]] = {
         "event": {"type": "response.chunk"},
         "chunk": {
             "tool_result": {
@@ -190,7 +191,7 @@ class WebSourcesExtractionTest(unittest.TestCase):
         },
     }
 
-    EVENT_CHUNK_LIVE_WEBPAGES = {
+    EVENT_CHUNK_LIVE_WEBPAGES: ClassVar[dict[str, Any]] = {
         "event": {"type": "response.chunk"},
         "chunk": {
             "tool_result": {
@@ -319,7 +320,7 @@ class GatewaySessionAskSourcesTest(unittest.IsolatedAsyncioTestCase):
             @override
             async def recv(self, decode: bool | None = None) -> Data:
                 if not self._frames:
-                    raise asyncio.TimeoutError()
+                    raise TimeoutError()
                 return json.dumps(self._frames.pop(0))
 
             @override

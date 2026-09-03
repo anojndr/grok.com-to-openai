@@ -152,7 +152,7 @@ class ExtractAttachmentsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_input_file_part_without_usable_fields_is_dropped_loudly(self):
         msgs = [{"role": "user", "content": [{"type": "input_file"}]}]
-        out, jobs = await server.extract_attachments(msgs)
+        _out, jobs = await server.extract_attachments(msgs)
         self.assertEqual(jobs, [])
 
 

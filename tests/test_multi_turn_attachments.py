@@ -204,9 +204,9 @@ class StaleIdRetryTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(server, "upload_file", new=AsyncMock()),
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+            self.assertRaises(GatewayError),
         ):
-            with self.assertRaises(GatewayError):
-                await _run_turn(sess)
+            await _run_turn(sess)
         self.assertEqual(sess.last_dropped_attachment_ids, set())
 
     async def test_propagate_dropped_ids_to_source_checkpoint(self):
@@ -320,9 +320,9 @@ class StaleIdRetryTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(server, "upload_file", new=AsyncMock()),
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+            self.assertRaises(GatewayError),
         ):
-            with self.assertRaises(GatewayError):
-                await _run_turn(sess)
+            await _run_turn(sess)
         self.assertEqual(len(sess.calls), 1)
 
     async def test_midstream_file_error_not_retried(self):
@@ -332,9 +332,9 @@ class StaleIdRetryTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(server, "upload_file", new=AsyncMock()),
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+            self.assertRaises(GatewayError),
         ):
-            with self.assertRaises(GatewayError):
-                await _run_turn(sess)
+            await _run_turn(sess)
         self.assertEqual(len(sess.calls), 1)
 
     async def test_failed_new_uploads_still_fail_the_turn(self):
@@ -348,9 +348,9 @@ class StaleIdRetryTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=UploadError("init failed 403")),
             ),
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+            self.assertRaises(GatewayError) as ctx,
         ):
-            with self.assertRaises(GatewayError) as ctx:
-                await _run_turn(sess, file_jobs=jobs)
+            await _run_turn(sess, file_jobs=jobs)
         self.assertIn("attachment upload failed", str(ctx.exception))
         self.assertEqual(len(sess.calls), 0)
 

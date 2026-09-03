@@ -75,12 +75,12 @@ class StreamTurnUploadTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=UploadError("init failed 403")),
             ),
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+            self.assertRaises(GatewayError) as ctx,
         ):
-            with self.assertRaises(GatewayError) as ctx:
-                async for _ in server.stream_session_turn(
-                    sess, "fact check this", file_jobs=jobs
-                ):
-                    pass
+            async for _ in server.stream_session_turn(
+                sess, "fact check this", file_jobs=jobs
+            ):
+                pass
         self.assertIn("attachment upload failed", str(ctx.exception))
         self.assertIsNone(sess.last_kwargs)
 
@@ -131,15 +131,15 @@ class StreamTurnUploadTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=UploadError("init failed 403")),
             ),
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+            self.assertRaises(GatewayError),
         ):
-            with self.assertRaises(GatewayError):
-                async for _ in server.stream_session_turn(
-                    sess,
-                    "fact check this",
-                    attachment_ids=["caller-supplied"],
-                    file_jobs=jobs,
-                ):
-                    pass
+            async for _ in server.stream_session_turn(
+                sess,
+                "fact check this",
+                attachment_ids=["caller-supplied"],
+                file_jobs=jobs,
+            ):
+                pass
         self.assertIsNone(sess.last_kwargs)
 
     async def test_upload_without_metadata_id_counts_as_failure(self):
@@ -149,12 +149,10 @@ class StreamTurnUploadTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(server, "upload_file", new=AsyncMock(return_value={})),
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+            self.assertRaises(GatewayError) as ctx,
         ):
-            with self.assertRaises(GatewayError) as ctx:
-                async for _ in server.stream_session_turn(
-                    sess, "prompt", file_jobs=jobs
-                ):
-                    pass
+            async for _ in server.stream_session_turn(sess, "prompt", file_jobs=jobs):
+                pass
         self.assertIn("no fileMetadataId", str(ctx.exception))
 
     def test_sig_headers_survive_generate_crash(self):
@@ -176,7 +174,6 @@ class EnsurePairResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         async def fetch_page():
             calls.append(1)
-            return None  # fetch_page now returns None for challenge pages
 
         await gen.ensure_pair(fetch_page)
         self.assertFalse(gen.ready)
@@ -192,6 +189,7 @@ class ResponsesStreamFailureTests(unittest.IsolatedAsyncioTestCase):
         import os
         import shutil
         import tempfile
+
         from accounts import AccountPool
         from session_store import SqliteStore
 
@@ -251,7 +249,7 @@ class ResponsesStreamFailureTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
             patch.object(server, "host_images", new=AsyncMock(return_value=[])),
         ):
-            resp, text = await self._collect(req)
+            _resp, text = await self._collect(req)
 
         self.assertIn("response.failed", text)
         self.assertIn("attachment upload failed", text)
@@ -292,7 +290,7 @@ class ResponsesStreamFailureTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
             patch.object(server, "host_images", new=AsyncMock(return_value=[])),
         ):
-            resp, text = await self._collect(req)
+            _resp, text = await self._collect(req)
 
         self.assertIn("response.output_text.delta", text)
         self.assertIn("response.completed", text)

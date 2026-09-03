@@ -13,18 +13,20 @@ import json
 import sys
 import time
 from collections.abc import AsyncIterable, Iterable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import server
-import grok_gateway as gw
-from grok_gateway import GrokSession, GatewayError, TurnResult
-from uploads import upload_file
 from websockets.asyncio.client import ClientConnection
 from websockets.frames import CloseCode
 from websockets.typing import Data, DataLike
+
+import grok_gateway as gw
+import server
+from grok_gateway import GatewayError, GrokSession, TurnResult
+from uploads import upload_file
 
 OUT = Path("/tmp/inv")
 ATTACH = OUT / "outC.jpg"  # real cat photo, no hat
@@ -81,10 +83,8 @@ class TeeWS(ClientConnection):
         try:
             await self._ws.close(code, reason)
         finally:
-            try:
+            with suppress(OSError):
                 self._fh.close()
-            except Exception:
-                pass
 
     def _log(self, direction: str, raw: str) -> None:
         self._fh.write(
@@ -165,13 +165,28 @@ async def run_one(
                 p = OUT / f"cap_{i}_{j}{Path(name).suffix or '.jpg'}"
                 p.write_bytes(data)
                 print(f"[{i}] saved {p.name} ({len(data)}b)", flush=True)
-            except Exception as e:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                TimeoutError,
+            ) as e:
                 print(f"[{i}] download failed {u[:80]}: {e}", flush=True)
         return True
     except GatewayError as e:
         print(f"[{i}] gateway error ({e.kind}): {e}", flush=True)
         return False
-    except Exception as e:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        KeyError,
+        TimeoutError,
+    ) as e:
         print(f"[{i}] error: {type(e).__name__}: {e}", flush=True)
         return False
     finally:
@@ -186,7 +201,17 @@ async def main() -> None:
     for i in range(n):
         try:
             await run_one(i, acc_key=acc_key, prompt=prompt, image=image)
-        except Exception as e:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            AssertionError,
+            TimeoutError,
+            GatewayError,
+        ) as e:
             print(f"[{i}] fatal: {type(e).__name__}: {e}", flush=True)
         await asyncio.sleep(2)
     print("capture done", flush=True)

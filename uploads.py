@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import mimetypes
 import re
+import socket
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
-import ipaddress
-import socket
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
 
-from config import GROK_BASE, USER_AGENT, PIXELVAULT_API_KEY, PIXELVAULT_BASE
+from config import GROK_BASE, PIXELVAULT_API_KEY, PIXELVAULT_BASE, USER_AGENT
 from statsig import StatsigGenerator
 
 
@@ -41,7 +42,7 @@ def _sig_headers(
     if statsig is not None and statsig.ready:
         try:
             return {"x-statsig-id": statsig.generate(path, method)}
-        except Exception:
+        except (ValueError, TypeError, AttributeError, RuntimeError):
             # Corrupt seed/hex (e.g. bad cached state) must not fail the
             # upload; proceed without the optional header instead.
             return {}
@@ -136,7 +137,7 @@ async def upload_file(
     raise UploadError("file processing did not complete")
 
 
-DATA_URL_RE = re.compile(r"^data:([^;,]+)?((?:;[^;,]*)*),", re.I)
+DATA_URL_RE = re.compile(r"^data:([^;,]+)?((?:;[^;,]*)*),", re.IGNORECASE)
 
 
 def decode_data_url(value: str) -> tuple[bytes, str | None, str]:
@@ -178,10 +179,8 @@ async def pixelvault_upload(
             timeout=60,
         )
         j = {}
-        try:
+        with suppress(ValueError, TypeError, AttributeError):
             j = r.json()
-        except Exception:
-            pass
         if r.status_code in (200, 201) and isinstance(j.get("data"), dict):
             return j["data"]
         raise UploadError(f"pixelvault {r.status_code}: {str(j)[:200]}")
@@ -227,10 +226,8 @@ async def pixelvault_upload_from_url(url: str) -> dict[str, Any]:
             timeout=90,
         )
         j = {}
-        try:
+        with suppress(ValueError, TypeError, AttributeError):
             j = r.json()
-        except Exception:
-            pass
         if r.status_code in (200, 201) and isinstance(j.get("data"), dict):
             return j["data"]
         # fallback: download then direct upload
@@ -241,7 +238,15 @@ async def pixelvault_upload_from_url(url: str) -> dict[str, Any]:
             ct = dr.headers.get("content-type", "image/png").split(";")[0]
             name = Path(url.split("?")[0]).name or "image"
             return await pixelvault_upload(dr.content, name, ct)
-        except Exception as e:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            TimeoutError,
+            UploadError,
+        ) as e:
             raise UploadError(
                 f"pixelvault {r.status_code}: {str(j)[:160]} / download: {e}"
-            )
+            ) from e

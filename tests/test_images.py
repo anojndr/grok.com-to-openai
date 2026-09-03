@@ -14,14 +14,15 @@ from types import SimpleNamespace
 from typing import Any, Literal, overload, override
 from unittest.mock import AsyncMock, patch
 
-import server
-from accounts import Account
-from grok_gateway import GrokSession
-from uploads import UploadError
 from websockets.asyncio.client import ClientConnection
 from websockets.frames import CloseCode
 from websockets.protocol import State
 from websockets.typing import Data, DataLike
+
+import server
+from accounts import Account
+from grok_gateway import GrokSession
+from uploads import UploadError
 
 
 class FakePool:
