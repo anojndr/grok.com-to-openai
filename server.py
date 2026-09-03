@@ -9,6 +9,9 @@ Endpoints:
 Chat runs over Grok's WebSocket Gateway (fast path, no browser). Multi-turn
 conversations attach each new request to an immutable user-chain checkpoint
 (conversation attach + parent_response_id), sending only the newest user message.
+Requests that miss every checkpoint (account failover, restart, prefix
+mismatch) resend the client-supplied transcript instead of a bare latest
+message, so context is never silently dropped.
 """
 from __future__ import annotations
 
@@ -234,6 +237,40 @@ def chain_key(users: list[str], auth_token: str = "") -> str:
     payload = {"auth": auth_token, "users": users}
     canon = json.dumps(payload, ensure_ascii=False)
     return hashlib.sha256(canon.encode()).hexdigest()[:24]
+
+
+def build_history_prompt(flat_messages: list[dict], latest_prompt: str) -> str:
+    """Full-transcript prompt for turns with no grok-side continuation.
+
+    OpenAI requests are stateless: the client resends the whole conversation
+    every turn, but continued turns forward only the newest message and rely
+    on the gateway holding history (conversation attach + parent_response_id
+    + keep_context). When no checkpoint exists for this chain — account
+    failover, restart miss, prefix mismatch — shipping the bare latest
+    message silently drops all context (the "remember 974" -> "3"
+    hallucination). The transcript restores it as plain role-labeled text.
+
+    Single-turn requests return `latest_prompt` byte-identical so the common
+    case pays no extra tokens and no formatting churn.
+    """
+    turns: list[tuple[str, str]] = []
+    for m in flat_messages:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        c = m.get("content")
+        text = c if isinstance(c, str) else content_to_text(c)
+        if isinstance(text, str) and text.strip():
+            turns.append((role, text.strip()))
+    if turns and turns[-1][0] == "user":
+        turns[-1] = ("user", latest_prompt.strip() or turns[-1][1])
+    elif latest_prompt.strip():
+        turns.append(("user", latest_prompt.strip()))
+    if len(turns) <= 1:
+        return latest_prompt
+    return "\n\n".join(
+        f"{'User' if role == 'user' else 'Assistant'}: {text}" for role, text in turns
+    )
 
 
 # ---------------------------------------------------------------- sources bridge
@@ -593,7 +630,7 @@ def _propagate_dropped_attachments(source_sess: Any, forked_sess: Any) -> None:
 
 async def stream_session_turn(sess: GrokSession, prompt: str, *,
                               attachment_ids=None, system_prompt=None,
-                              file_jobs=None) -> AsyncIterator[dict]:
+                              file_jobs=None, user_text=None) -> AsyncIterator[dict]:
     """Yield gateway events in real time (text_delta / reasoning_delta /
     image_url / done). Files are per-account on grok.com ("FileAttachment
     not found" on cross-account mentions), so upload with THIS session's
@@ -742,9 +779,12 @@ async def stream_session_turn(sess: GrokSession, prompt: str, *,
     mention_ids = ([i for i in mention_ids if i not in turn_set]
                    + [i for i in turn_ids if i in mention_ids])[-MAX_TURN_MENTIONS:]
     events_yielded = False
+    # user_text feeds degraded-query detection; it must stay the newest user
+    # message even when prompt carries the full-transcript fallback.
+    latest_text = user_text if isinstance(user_text, str) and user_text else prompt
     try:
         async for ev in sess.ask(prompt, attachment_ids=mention_ids or None,
-                                 system_prompt=system_prompt, user_text=prompt):
+                                 system_prompt=system_prompt, user_text=latest_text):
             events_yielded = True
             yield ev
     except GatewayError as e:
@@ -766,7 +806,7 @@ async def stream_session_turn(sess: GrokSession, prompt: str, *,
             sess.attachments = registry
             retry_ids = [i for i in mention_ids if i not in stale]
             async for ev in sess.ask(prompt, attachment_ids=retry_ids or None,
-                                     system_prompt=system_prompt, user_text=prompt):
+                                     system_prompt=system_prompt, user_text=latest_text):
                 yield ev
         else:
             raise
@@ -774,13 +814,14 @@ async def stream_session_turn(sess: GrokSession, prompt: str, *,
 
 async def run_session_turn(sess: GrokSession, prompt: str, *,
                            attachment_ids=None, system_prompt=None,
-                           file_jobs=None) -> tuple[TurnResult, list[dict]]:
+                           file_jobs=None, user_text=None) -> tuple[TurnResult, list[dict]]:
     """Buffered variant of stream_session_turn for non-streaming requests."""
     events = []
     async for ev in stream_session_turn(sess, prompt,
                                         attachment_ids=attachment_ids,
                                         system_prompt=system_prompt,
-                                        file_jobs=file_jobs):
+                                        file_jobs=file_jobs,
+                                        user_text=user_text):
         events.append(ev)
     done = next((e for e in events if e["type"] == "done"), None)
     if not done:
@@ -804,6 +845,10 @@ async def pick_account_and_stream_turn(session_key: str | None,
     tried: set[str] = set()
     last_err: GatewayError | None = None
     mode = kwargs.get("mode") or "fast"
+    # Continuations forward only the newest message (gateway holds history);
+    # fresh sessions have no gateway history, so they resend the transcript.
+    latest_msg = kwargs.get("latest") or kwargs.get("prompt") or ""
+    fresh_prompt = kwargs.get("history_prompt") or kwargs.get("prompt")
     while True:
         await pool.reload_if_changed()
         if session_key:
@@ -851,7 +896,8 @@ async def pick_account_and_stream_turn(session_key: str | None,
                                 st.grok, kwargs.get("prompt"),
                                 attachment_ids=kwargs.get("attachment_ids"),
                                 file_jobs=kwargs.get("file_jobs"),
-                                system_prompt=kwargs.get("system_prompt")):
+                                system_prompt=kwargs.get("system_prompt"),
+                                user_text=latest_msg):
                             yielded_any = True
                             ev = dict(ev)
                             ev["acc"] = acc
@@ -887,11 +933,17 @@ async def pick_account_and_stream_turn(session_key: str | None,
         try:
             sess, _ = await get_or_create_session(None, users, acc, mode=mode)
             state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
+            if fresh_prompt != kwargs.get("prompt"):
+                logging.getLogger("uvicorn.error").warning(
+                    "no checkpoint for this chain; starting a fresh grok "
+                    "session with the full transcript (%d user message(s))",
+                    len(users))
             async for ev in stream_session_turn(
-                    sess, kwargs.get("prompt"),
+                    sess, fresh_prompt,
                     attachment_ids=kwargs.get("attachment_ids"),
                     file_jobs=kwargs.get("file_jobs"),
-                    system_prompt=kwargs.get("system_prompt")):
+                    system_prompt=kwargs.get("system_prompt"),
+                    user_text=latest_msg):
                 yielded_any = True
                 ev = dict(ev)
                 ev["acc"] = acc
@@ -1102,6 +1154,10 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
     tried: set[str] = set()
     last_err: GatewayError | None = None
     mode = kwargs.get("mode") or "fast"
+    # Continuations forward only the newest message (gateway holds history);
+    # fresh sessions have no gateway history, so they resend the transcript.
+    latest_msg = kwargs.get("latest") or kwargs.get("prompt") or ""
+    fresh_prompt = kwargs.get("history_prompt") or kwargs.get("prompt")
     while True:
         await pool.reload_if_changed()
         if session_key:
@@ -1147,7 +1203,8 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
                             st.grok, kwargs.get("prompt"),
                             attachment_ids=kwargs.get("attachment_ids"),
                             file_jobs=kwargs.get("file_jobs"),
-                            system_prompt=kwargs.get("system_prompt"))
+                            system_prompt=kwargs.get("system_prompt"),
+                            user_text=latest_msg)
                         _propagate_dropped_attachments(source_state.grok, st.grok)
                         pool.release_ok(acc)
                         turned_ok = True
@@ -1173,11 +1230,17 @@ async def pick_account_and_turn(session_key: str | None, users: list[str], **kwa
         sess = None
         try:
             sess, _ = await get_or_create_session(None, users, acc, mode=mode)
+            if fresh_prompt != kwargs.get("prompt"):
+                logging.getLogger("uvicorn.error").warning(
+                    "no checkpoint for this chain; starting a fresh grok "
+                    "session with the full transcript (%d user message(s))",
+                    len(users))
             result, events = await run_session_turn(
-                sess, kwargs.get("prompt"),
+                sess, fresh_prompt,
                 attachment_ids=kwargs.get("attachment_ids"),
                 file_jobs=kwargs.get("file_jobs"),
-                system_prompt=kwargs.get("system_prompt"))
+                system_prompt=kwargs.get("system_prompt"),
+                user_text=latest_msg)
             pool.release_ok(acc)
             state = SessionState(account_key=acc.key, grok=sess, user_chain=list(users))
             return acc, result, events, state
@@ -1312,10 +1375,14 @@ async def chat_completions(request: Request):
     rid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = now_epoch()
     req_include_sources = _include_sources(body.get("include_sources"))
+    # Transcript fallback for turns that miss every grok-side checkpoint
+    # (failover / restart / prefix mismatch). Continuations ignore it.
+    history_prompt = build_history_prompt(flat, prompt)
 
     if not stream:
         acc, result, events, state = await pick_account_and_turn(
             prefix_key, users[:], mode=mode, prompt=prompt,
+            history_prompt=history_prompt, latest=prompt,
             file_jobs=remaining_jobs or None, system_prompt=system_prompt)
 
         # persist so the NEXT incremental call (prefix == our full chain) reuses it
@@ -1386,6 +1453,7 @@ async def chat_completions(request: Request):
             if isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
                 mock_res = await pick_account_and_turn(
                     prefix_key, users[:], mode=mode, prompt=prompt,
+                    history_prompt=history_prompt, latest=prompt,
                     file_jobs=remaining_jobs or None, system_prompt=system_prompt)
                 turn_acc, mock_turn_res, mock_events, turn_state = mock_res
                 final_turn_result = mock_turn_res
@@ -1400,6 +1468,7 @@ async def chat_completions(request: Request):
             else:
                 async for ev in pick_account_and_stream_turn(
                         prefix_key, users[:], mode=mode, prompt=prompt,
+                        history_prompt=history_prompt, latest=prompt,
                         file_jobs=remaining_jobs or None, system_prompt=system_prompt):
                     turn_acc = ev.get("acc")
                     turn_state = ev.get("state")
@@ -1629,6 +1698,8 @@ async def responses_api(request: Request):
     msg_id = "msg_" + uuid.uuid4().hex
     created = now_epoch()
     req_include_sources = _include_sources(body.get("include_sources"))
+    # Transcript fallback for turns that miss every grok-side checkpoint.
+    history_prompt = build_history_prompt(flat, prompt)
 
     if not stream:
         # continue previous response's grok session when provided
@@ -1659,6 +1730,7 @@ async def responses_api(request: Request):
         else:
             acc, result, events, state = await pick_account_and_turn(
                 prefix_key, users[:], mode=mode, prompt=prompt,
+                history_prompt=history_prompt, latest=prompt,
                 file_jobs=remaining_jobs or None, system_prompt=instructions)
 
         image_urls = list(result.image_urls)
@@ -1840,6 +1912,7 @@ async def responses_api(request: Request):
         elif isinstance(pick_account_and_turn, (unittest.mock.NonCallableMagicMock, unittest.mock.AsyncMock, unittest.mock.MagicMock, unittest.mock.Mock)):
             mock_res = await pick_account_and_turn(
                 prefix_key, users[:], mode=mode, prompt=prompt,
+                history_prompt=history_prompt, latest=prompt,
                 file_jobs=remaining_jobs or None, system_prompt=instructions)
             turn_acc, mock_turn_res, mock_events, turn_state = mock_res
             final_turn_result = mock_turn_res
@@ -1853,6 +1926,7 @@ async def responses_api(request: Request):
             try:
                 async for ev in pick_account_and_stream_turn(
                         prefix_key, users[:], mode=mode, prompt=prompt,
+                        history_prompt=history_prompt, latest=prompt,
                         file_jobs=remaining_jobs or None, system_prompt=instructions):
                     turn_acc = ev.get("acc")
                     turn_state = ev.get("state")

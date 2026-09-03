@@ -316,7 +316,13 @@ def default_x_grok() -> dict:
         "force_side_by_side": False, "enable_image_generation": True,
         "image_generation_count": 2, "disable_text_follow_ups": False,
         "disable_artifact": True, "force_concise": False,
-        "keep_context": False, "is_temporary": True, "disable_memory": True,
+        # keep_context MUST stay True: continued turns send only the newest
+        # user message and rely on the gateway holding the conversation.
+        # (False caused total multi-turn amnesia: "remember 974" followed by
+        # "what number?" hallucinated "3".) is_temporary/disable_memory stay
+        # set so pooled accounts never persist chats or leak long-term memory
+        # across unrelated users sharing an account.
+        "keep_context": True, "is_temporary": True, "disable_memory": True,
     }
 
 
