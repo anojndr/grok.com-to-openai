@@ -960,31 +960,48 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
             }]},
         }
         urls: list[str] = []
+        completed_jobs: set[str] = set()
+        imagine_url_pat = re.compile(r"https://imagine-public[^\s\"\\]+")
         try:
             async with websockets.connect(uri, additional_headers=ws_headers,
                                           max_size=32 * 1024 * 1024,
                                           open_timeout=10, close_timeout=5) as ws:
                 await ws.send(json.dumps(msg))
                 while True:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=60)
-                    pat = re.compile(r"https://imagine-public[^" + chr(34) + chr(92) + chr(92) + chr(92) + "s]+")
-                    for u in pat.findall(raw):
+                    # Once images are flowing, a short idle means the job is
+                    # done: the imagine protocol never sends response.done,
+                    # it sends json current_status=completed per job. Waiting
+                    # the full 60s here made every image turn take 60s+.
+                    idle = 8.0 if urls else 60.0
+                    raw = await asyncio.wait_for(ws.recv(), timeout=idle)
+                    for u in imagine_url_pat.findall(raw):
                         if u not in urls:
                             urls.append(u)
-                    env = json.loads(raw)
+                    try:
+                        env = json.loads(raw)
+                    except Exception:
+                        continue
                     etype = env.get("type", "")
-                    if etype == "error":
+                    if etype == "image":
+                        u = str(env.get("url") or "")
+                        if u and u not in urls:
+                            urls.append(u)
+                    elif etype == "error":
                         err_code = env.get("err_code", "")
                         if "rate_limit" in err_code:
                             pool.release_fail(acc, "quota")
                             last_err = f"account {acc.index} rate limited"
                             break
                         raise RuntimeError(f"imagine error: {env.get('err_msg', err_code)}")
-                    if etype == "image" and urls:
-                        # We have at least one image; wait briefly for more
-                        pass
-                    if etype == "response.done":
-                        break
+                    elif etype == "json":
+                        if env.get("current_status") == "completed":
+                            jid = str(env.get("job_id") or "")
+                            if jid:
+                                completed_jobs.add(jid)
+                            # Both generations finished -> return immediately
+                            # instead of idling for the 60s recv timeout.
+                            if len(completed_jobs) >= num_images and len(urls) >= num_images:
+                                break
         except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
             if urls:
                 pass  # got some images despite timeout
@@ -1001,8 +1018,8 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
 
         if urls:
             pool.release_ok(acc)
-            # prefer jpg over png
-            jpg = [u for u in urls if u.endswith(".jpg")]
+            # prefer jpg over png (strip query strings before suffix check)
+            jpg = [u for u in urls if u.split("?")[0].endswith(".jpg")]
             return jpg if jpg else urls
 
     if last_err is None:
