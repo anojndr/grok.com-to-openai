@@ -10,6 +10,7 @@ Persists:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -126,11 +127,17 @@ class SqliteStore:
         d: dict[str, Any] = dict(row)
         try:
             d["user_chain"] = json.loads(d.get("user_chain_json") or "[]")
-        except Exception:
+        except (ValueError, TypeError, AttributeError) as e:
+            logging.getLogger("uvicorn.error").debug(
+                "dropping corrupt user_chain for session %s: %s", session_key, e
+            )
             d["user_chain"] = []
         try:
             raw = json.loads(d.get("attachments_json") or "[]")
-        except Exception:
+        except (ValueError, TypeError, AttributeError) as e:
+            logging.getLogger("uvicorn.error").debug(
+                "dropping corrupt attachments for session %s: %s", session_key, e
+            )
             raw = []
         d["attachments"] = clean_attachment_rows(raw)
         return d
@@ -254,7 +261,12 @@ class SqliteStore:
             d: dict[str, Any] = dict(r)
             try:
                 d["user_chain"] = json.loads(d.get("user_chain_json") or "[]")
-            except Exception:
+            except (ValueError, TypeError, AttributeError) as e:
+                logging.getLogger("uvicorn.error").debug(
+                    "dropping corrupt user_chain for session %s: %s",
+                    d.get("session_key"),
+                    e,
+                )
                 d["user_chain"] = []
             out[d["session_key"]] = d
         return out
@@ -378,6 +390,8 @@ class SqliteStore:
             if self._conn:
                 try:
                     self._conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error as e:
+                    logging.getLogger("uvicorn.error").debug(
+                        "sqlite close failed: %s", e
+                    )
                 self._conn = None

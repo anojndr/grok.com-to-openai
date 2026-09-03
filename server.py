@@ -17,44 +17,39 @@ message, so context is never silently dropped.
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
-import logging
 import json
-import os
+import logging
 import re
-import struct
+import sqlite3
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
+import grok_gateway as gw
+from accounts import Account, AccountPool
 from config import (
     API_KEY,
     COOLDOWN_SECONDS,
     DEFAULT_MODEL,
     GROK_BASE,
-    PORT,
-    SESSION_TTL,
-    MAX_SESSIONS,
-    USER_AGENT,
     INCLUDE_SOURCES,
+    MAX_SESSIONS,
+    SESSION_TTL,
+    USER_AGENT,
 )
-from accounts import Account, AccountPool
+from grok_gateway import GatewayError, GrokSession, RenderFilter, TurnResult
+from session_store import MAX_TRACKED_ATTACHMENTS, SqliteStore, clean_attachment_rows
 from statsig import (
     StatsigGenerator,
-    STATSIG_EPOCH,
-    SALT,
-    compute_animation_hex,
-    curves_to_path,
 )
-from session_store import SqliteStore, MAX_TRACKED_ATTACHMENTS, clean_attachment_rows
-
-
 from uploads import (
     UploadError,
     decode_data_url,
@@ -63,8 +58,6 @@ from uploads import (
     pixelvault_upload_from_url,
     upload_file,
 )
-import grok_gateway as gw
-from grok_gateway import GrokSession, GatewayError, TurnResult, RenderFilter
 
 app = FastAPI(title="grok-to-openai-api", version="1.0")
 
@@ -162,13 +155,11 @@ async def prune_sessions() -> None:
     # Prune sqlite store outside the lock to avoid blocking other requests on disk I/O
     try:
         store.prune_stale_sessions(SESSION_TTL, MAX_SESSIONS)
-    except Exception:
-        pass
+    except (OSError, RuntimeError, ValueError, AttributeError, sqlite3.Error) as e:
+        logging.getLogger("uvicorn.error").debug("session prune failed: %s", e)
     for g in to_close:
-        try:
+        with suppress(OSError, RuntimeError, AttributeError):
             await g.close()
-        except Exception:
-            pass
 
 
 async def get_or_create_session(
@@ -403,7 +394,7 @@ def check_auth(request: Request) -> None:
 IMAGE_WORDS = re.compile(
     r"\b(generate|create|draw|paint|render|make|imagine)\b[^.?!]{0,60}\b(image|picture|photo|drawing|art|illustration|logo|wallpaper|portrait|scene|cat|dog|animal)\b"
     r"|\b(image|picture|photo|drawing|illustration)\s+of\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 # Cross-turn attachment memory (see stream_session_turn): grok's gateway only
@@ -433,7 +424,7 @@ TEXTUAL_MIMES = {
 TEXTUAL_EXT = re.compile(
     r"\.(txt|md|markdown|json|jsonl|yaml|yml|toml|ini|cfg|conf|py|js|mjs|cjs|ts|tsx|jsx|"
     r"java|kt|go|rs|rb|php|c|h|cpp|hpp|cs|swift|sh|bash|zsh|sql|html?|css|scss|xml|csv|tsv|log|env)$",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -467,8 +458,15 @@ async def refresh_statsig_pair() -> None:
 
     try:
         await statsig.ensure_pair(fetch_page)
-    except Exception:
-        pass
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        TimeoutError,
+    ) as e:
+        logging.getLogger("uvicorn.error").debug("statsig refresh failed: %s", e)
     if not statsig.ready and time.time() - _last_statsig_warn > 600:
         _last_statsig_warn = time.time()
         logging.getLogger("uvicorn.error").warning(
@@ -625,7 +623,15 @@ async def extract_attachments(
                         "job": {"name": item["name"], "data": dr.content, "mime": mime},
                         "url": url,
                     }
-            except Exception as e:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                KeyError,
+                TimeoutError,
+            ) as e:
                 logging.getLogger("uvicorn.error").warning(
                     "attachment download failed (%s): %s", url[:120], e
                 )
@@ -665,7 +671,7 @@ def inline_textual(job: dict[str, Any]) -> str | None:
             )
             lang = ext if len(ext) <= 8 else ""
             return f"```{lang} {name}\n{text}\n```"
-        except Exception:
+        except (ValueError, TypeError, AttributeError, UnicodeError):
             return None
     return None
 
@@ -862,7 +868,15 @@ async def stream_session_turn(
                                     n,
                                     "upload returned no fileMetadataId",
                                 )
-                            except Exception as e:
+                            except (
+                                OSError,
+                                RuntimeError,
+                                ValueError,
+                                TypeError,
+                                AttributeError,
+                                TimeoutError,
+                                UploadError,
+                            ) as e:
                                 return (oi, None, h, n, str(e))
 
                     results = await asyncio.gather(
@@ -895,7 +909,16 @@ async def stream_session_turn(
                                 new_entries.append({"file_id": fid, "hash": h})
                             else:
                                 upload_errors.append(f"{n}: {err}")
-                except Exception as e:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    TimeoutError,
+                    UploadError,
+                    GatewayError,
+                ) as e:
                     upload_errors.append(str(e))
             else:
                 # Only dedup hits, no real uploads: still need to replay dedups in order
@@ -1170,10 +1193,8 @@ async def pick_account_and_stream_turn(
             kind = e.kind if e.kind in ("auth", "quota", "degraded") else "generic"
             pool.release_fail(acc, kind)
             if sess is not None:
-                try:
+                with suppress(OSError, RuntimeError, AttributeError):
                     await sess.close()
-                except Exception:
-                    pass
             if yielded_any:
                 status = 429 if e.kind == "quota" else 502
                 raise HTTPException(status, f"grok error ({e.kind}): {e}")
@@ -1185,6 +1206,7 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
     Rotates across accounts until one produces images or the whole pool has
     been tried. Returns list of public image URLs."""
     import uuid as _uuid
+
     import websockets
 
     last_err = None
@@ -1266,7 +1288,10 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
                             urls.append(u)
                     try:
                         env = json.loads(raw_text)
-                    except Exception:
+                    except (ValueError, TypeError, AttributeError) as e:
+                        logging.getLogger("uvicorn.error").debug(
+                            "skipping malformed imagine frame: %s", e
+                        )
                         continue
                     etype = env.get("type", "")
                     if etype == "image":
@@ -1294,7 +1319,7 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
                                 and len(urls) >= num_images
                             ):
                                 break
-        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+        except (TimeoutError, websockets.exceptions.ConnectionClosed):
             if urls:
                 pass  # got some images despite timeout
             else:
@@ -1303,7 +1328,7 @@ async def grok_generate_image(prompt: str, num_images: int = 2) -> list[str]:
                 continue
         except RuntimeError:
             raise
-        except Exception as e:
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as e:
             pool.release_fail(acc, "generic")
             last_err = f"account {acc.index}: {e}"
             continue
@@ -1375,14 +1400,31 @@ async def host_images(urls: list[str], cookie: str = "") -> list[str]:
             else:
                 try:
                     info = await pixelvault_upload_from_url(u)
-                except Exception:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    TimeoutError,
+                    UploadError,
+                ):
                     data, mime, name = await _download_asset(u, asset_cookie)
                     info = await pixelvault_upload(data, name, guess_mime(name, mime))
             raw_url = info.get("url") if isinstance(info, dict) else None
             if isinstance(raw_url, str) and raw_url:
                 return raw_url
             return None
-        except Exception as e:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            TimeoutError,
+            UploadError,
+        ) as e:
             logging.getLogger("uvicorn.error").warning(
                 "image hosting failed for %s: %s", u[:120], e
             )
@@ -1522,10 +1564,8 @@ async def pick_account_and_turn(
             return acc, result, events, state
         except GatewayError as e:
             if sess is not None:
-                try:
+                with suppress(OSError, RuntimeError, AttributeError):
                     await sess.close()
-                except Exception:
-                    pass
             kind = e.kind if e.kind in ("auth", "quota", "degraded") else "generic"
             pool.release_fail(acc, kind)
             last_err = e
@@ -1539,8 +1579,8 @@ async def chat_completions(request: Request) -> Any:
     check_auth(request)
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(400, "invalid JSON payload")
+    except (ValueError, TypeError, AttributeError, RuntimeError, OSError) as e:
+        raise HTTPException(400, f"invalid JSON payload: {e}") from e
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be a JSON object")
 
@@ -1608,7 +1648,15 @@ async def chat_completions(request: Request) -> Any:
                 await refresh_statsig_pair()
                 asset_paths = await grok_generate_image(prompt)
                 break
-            except Exception as e:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                KeyError,
+                TimeoutError,
+            ) as e:
                 img_errs.append(str(e)[:100])
                 logging.getLogger("uvicorn.error").warning(
                     "image gen attempt %d/%d: %s", attempt + 1, 3, e
@@ -1713,7 +1761,7 @@ async def chat_completions(request: Request) -> Any:
     history_prompt = build_history_prompt(flat, prompt)
 
     if not stream:
-        acc, result, events, state = await pick_account_and_turn(
+        acc, result, _events, state = await pick_account_and_turn(
             prefix_key,
             users[:],
             mode=mode,
@@ -1832,7 +1880,7 @@ async def chat_completions(request: Request) -> Any:
                     file_jobs=remaining_jobs or None,
                     system_prompt=system_prompt,
                 )
-                turn_acc, mock_turn_res, mock_events, turn_state = mock_res
+                turn_acc, mock_turn_res, _mock_events, turn_state = mock_res
                 if not isinstance(mock_turn_res, TurnResult):
                     raise GatewayError("upstream", "no result from gateway")
                 final_turn_result = mock_turn_res
@@ -2011,7 +2059,18 @@ async def chat_completions(request: Request) -> Any:
                 }
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
             yield "data: [DONE]\n\n"
-        except Exception as e:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            IndexError,
+            TimeoutError,
+            GatewayError,
+            HTTPException,
+        ) as e:
             logging.getLogger("uvicorn.error").error("Chat SSE stream error: %s", e)
 
     return StreamingResponse(sse(), media_type="text/event-stream")
@@ -2024,7 +2083,7 @@ def iter_events(events):
 def inline_text_safe(job: dict[str, Any]) -> str | None:
     try:
         return inline_textual(job)
-    except Exception:
+    except (ValueError, TypeError, AttributeError, UnicodeError):
         return None
 
 
@@ -2036,8 +2095,8 @@ async def responses_api(request: Request) -> Any:
     check_auth(request)
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(400, "invalid JSON payload")
+    except (ValueError, TypeError, AttributeError, RuntimeError, OSError) as e:
+        raise HTTPException(400, f"invalid JSON payload: {e}") from e
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be a JSON object")
 
@@ -2181,7 +2240,7 @@ async def responses_api(request: Request) -> Any:
             forked = st.grok
             st.touch()
             try:
-                result, events = await run_session_turn(
+                result, _events = await run_session_turn(
                     st.grok,
                     prompt,
                     file_jobs=remaining_jobs or None,
@@ -2205,7 +2264,7 @@ async def responses_api(request: Request) -> Any:
                 if not turned_ok and forked is not None:
                     await forked.close()
         else:
-            acc, result, events, state = await pick_account_and_turn(
+            acc, result, _events, state = await pick_account_and_turn(
                 prefix_key,
                 users[:],
                 mode=mode,
@@ -2476,7 +2535,7 @@ async def responses_api(request: Request) -> Any:
                 file_jobs=remaining_jobs or None,
                 system_prompt=instructions,
             )
-            turn_acc, mock_turn_res, mock_events, turn_state = mock_res
+            turn_acc, mock_turn_res, _mock_events, turn_state = mock_res
             if not isinstance(mock_turn_res, TurnResult):
                 _fail_turn(GatewayError("upstream", "no result from gateway"))
             else:

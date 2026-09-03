@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import hashlib
+import json
+import logging
 import math
 import os
 import re
+import sqlite3
 import struct
 import time
 from collections.abc import Awaitable, Callable
@@ -179,13 +181,13 @@ def extract_meta_seed(html: str) -> str | None:
     m = re.search(
         r'<meta[^>]*name=["\']grok[‐‑‒–—―-]site[‐‑‒–—―-]verification["\'][^>]*content=["\']([^"\']+)["\']',
         html,
-        re.I,
+        re.IGNORECASE,
     )
     if not m:
         m = re.search(
             r'content=["\']([^"\']+)["\'][^>]*name=["\']grok[‐‑‒–—―-]site[‐‑‒–—―-]verification["\']',
             html,
-            re.I,
+            re.IGNORECASE,
         )
     if not m:
         return None
@@ -260,7 +262,7 @@ def extract_curves(html: str) -> list[Any] | None:
     trimmed = raw[:end] if end else raw
     try:
         return json.loads(trimmed)
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return None
 
 
@@ -283,7 +285,7 @@ class StatsigGenerator:
                 self._seed_b64 = s_b64
                 try:
                     self._seed_bytes = base64.b64decode(s_b64 + "==")
-                except Exception:
+                except (ValueError, TypeError, AttributeError):
                     self._seed_bytes = None
                 self._hex = h_str
                 self._fetched_at = f_at
@@ -315,7 +317,17 @@ class StatsigGenerator:
                     html: str | None = None
                     try:
                         html = await page()
-                    except Exception:
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        AttributeError,
+                        TimeoutError,
+                    ) as e:
+                        logging.getLogger("uvicorn.error").debug(
+                            "statsig page fetch failed: %s", e
+                        )
                         html = None
                     if not html:
                         return None
@@ -325,7 +337,7 @@ class StatsigGenerator:
                         return None
                     try:
                         seed = base64.b64decode(seed_b64 + "==")
-                    except Exception:
+                    except (ValueError, TypeError, AttributeError):
                         return None
                     if len(curves) == 0 or len(seed) < 48:
                         return None
@@ -333,7 +345,13 @@ class StatsigGenerator:
                     try:
                         path_d = curves_to_path(curves[idx])
                         computed_hex = compute_animation_hex(path_d, seed)
-                    except Exception:
+                    except (
+                        ValueError,
+                        TypeError,
+                        AttributeError,
+                        IndexError,
+                        KeyError,
+                    ):
                         return None
                     async with self._lock:
                         if self._hex and time.time() - self._fetched_at < 1800:
@@ -350,15 +368,25 @@ class StatsigGenerator:
                                 self.store.set_statsig(
                                     seed_b64, computed_hex, self._fetched_at
                                 )
-                            except Exception:
-                                pass
+                            except (
+                                OSError,
+                                RuntimeError,
+                                ValueError,
+                                TypeError,
+                                AttributeError,
+                                sqlite3.Error,
+                            ) as e:
+                                logging.getLogger("uvicorn.error").debug(
+                                    "statsig cache write failed: %s", e
+                                )
                         return seed_b64, computed_hex
 
                 task = asyncio.create_task(_do_fetch())
                 self._fetch_task = task
         try:
             result = await task
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as e:
+            logging.getLogger("uvicorn.error").debug("statsig fetch task failed: %s", e)
             result = None
         # If fetch failed, return stale; if succeeded, task already updated state
         if result is None:
@@ -374,7 +402,7 @@ class StatsigGenerator:
         self._seed_b64 = seed_b64
         try:
             self._seed_bytes = base64.b64decode(seed_b64 + "==")
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             self._seed_bytes = None
         self._hex = hex_str
         self._fetched_at = time.time()

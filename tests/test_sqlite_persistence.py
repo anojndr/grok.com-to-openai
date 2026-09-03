@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from typing import Any, override
 from unittest.mock import AsyncMock, patch
 
 from fastapi import Request
 
-import config
 import server
 from accounts import Account, AccountPool
-from grok_gateway import GrokSession, TurnResult
+from grok_gateway import TurnResult
 from session_store import SqliteStore
 from statsig import StatsigGenerator
 
@@ -125,9 +126,11 @@ class SqlitePersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         # Verify AccountPool loads state from store on reload
         acc_file = os.path.join(self.tmp_dir, "accounts.txt")
-        with open(acc_file, "w") as f:
-            f.write(".grok.com\tTRUE\t/\tTRUE\t2147483647\tsso\tsso_cookie_value\n")
-            f.write(".grok.com\tTRUE\t/\tTRUE\t2147483647\tx-userid\tuid_123\n")
+        await asyncio.to_thread(
+            Path(acc_file).write_text,
+            ".grok.com\tTRUE\t/\tTRUE\t2147483647\tsso\tsso_cookie_value\n"
+            ".grok.com\tTRUE\t/\tTRUE\t2147483647\tx-userid\tuid_123\n",
+        )
 
         pool = AccountPool(acc_file, store=self.store)
         await pool.reload_if_changed()

@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from typing import TYPE_CHECKING, Any
 
 import websockets
 
@@ -24,10 +27,10 @@ from config import GROK_BASE, USER_AGENT
 
 ASSET_BASE = "https://assets.grok.com/"
 
-RENDER_TAG_RE = re.compile(r"<grok:render\b.*?(?:</grok:render>|$)", re.S)
+RENDER_TAG_RE = re.compile(r"<grok:render\b.*?(?:</grok:render>|$)", re.DOTALL)
 URL_OR_PATH_RE = re.compile(
     r'(?:https?://assets\.grok\.com/users/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp|gif)|users/[0-9a-fA-F-]+/(?:generated|attachments)/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp|gif))',
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -400,7 +403,7 @@ async def resolve_user_id(cookie_header: str) -> str:
         if r.status_code == 200:
             try:
                 data = r.json()
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 data = None
             if isinstance(data, dict):
                 user = data.get("user")
@@ -437,7 +440,7 @@ class GrokSession:
         self.last_dropped_attachment_ids: set[str] = set()
         self.lock = asyncio.Lock()
 
-    def clone_checkpoint(self, model_mode: str | None = None) -> "GrokSession":
+    def clone_checkpoint(self, model_mode: str | None = None) -> GrokSession:
         """Create a disconnected session positioned at this conversation checkpoint."""
         sess = GrokSession(
             self.cookie_header,
@@ -492,8 +495,10 @@ class GrokSession:
                 raw = await asyncio.wait_for(ws.recv(), timeout=15)
                 try:
                     env = json.loads(raw)
-                except Exception as e:
-                    raise GatewayError("upstream", f"malformed json in handshake: {e}")
+                except (ValueError, TypeError, AttributeError) as e:
+                    raise GatewayError(
+                        "upstream", f"malformed json in handshake: {e}"
+                    ) from e
                 ev = env.get("event") or {}
                 if ev.get("type") == "session.created":
                     if not self.conversation_id:
@@ -505,12 +510,12 @@ class GrokSession:
         except GatewayError:
             await self.close()
             raise
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             await self.close()
             raise GatewayError(
                 "timeout", "gateway connect or handshake timed out"
             ) from e
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as e:
             await self.close()
             # Raw socket/TLS errors must fail over like any other retryable
             # gateway failure instead of escaping as a 500.
@@ -528,17 +533,13 @@ class GrokSession:
             ws = self.ws
             self.ws = None
             if ws:
-                try:
+                with suppress(OSError, RuntimeError, AttributeError):
                     await ws.close()
-                except Exception:
-                    pass
             return
         async with self.lock:
             if self.ws:
-                try:
+                with suppress(OSError, RuntimeError, AttributeError):
                     await self.ws.close()
-                except Exception:
-                    pass
                 self.ws = None
 
     def alive(self) -> bool:
@@ -552,7 +553,7 @@ class GrokSession:
             if isinstance(state, State):
                 return state is State.OPEN
             return False
-        except Exception:
+        except (AttributeError, TypeError, ValueError, RuntimeError):
             return False
 
     async def ask(
@@ -629,13 +630,16 @@ class GrokSession:
                             timeout=max(1.0, idle_timeout - (time.time() - last)),
                         )
                         last = time.time()
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         raise GatewayError("timeout", "gateway idle timeout")
                     except websockets.ConnectionClosed:
                         raise GatewayError("closed", "connection closed mid-turn")
                     try:
                         env = json.loads(raw)
-                    except Exception:
+                    except (ValueError, TypeError, AttributeError) as e:
+                        logging.getLogger("uvicorn.error").debug(
+                            "skipping malformed gateway frame: %s", e
+                        )
                         continue
                     ev = env.get("event") or {}
                     et = ev.get("type", "")

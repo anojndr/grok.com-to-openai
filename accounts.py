@@ -8,11 +8,11 @@ accounts.txt format: blocks of Netscape cookie files separated by optional
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import re
 import time
-import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 BLOCK_SPLIT = re.compile(r"(?m)^account\s+\d+:\s*$")

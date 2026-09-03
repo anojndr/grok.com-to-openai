@@ -192,7 +192,6 @@ class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
 
 class StreamUserTextTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_turn_forwards_latest_text_for_detection(self):
-        from grok_gateway import GatewayError
 
         calls: list[dict[str, Any]] = []
 

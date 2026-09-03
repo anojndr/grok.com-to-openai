@@ -18,8 +18,8 @@ Run: python3 -m unittest -v tests.test_degraded
 from __future__ import annotations
 
 import asyncio
-import time
 import json
+import time
 import unittest
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
 from pathlib import Path
@@ -28,14 +28,13 @@ from types import SimpleNamespace
 from typing import Any, Literal, overload, override
 from unittest.mock import patch
 
-import server
-from accounts import AccountPool
-from grok_gateway import GatewayError, GrokSession, TurnResult
-from grok_gateway import unrelated_queries
 from websockets.asyncio.client import ClientConnection
 from websockets.frames import CloseCode
 from websockets.typing import Data, DataLike
 
+import server
+from accounts import AccountPool
+from grok_gateway import GatewayError, GrokSession, TurnResult, unrelated_queries
 
 # --------------------------------------------------------------------- fakes
 
@@ -82,7 +81,7 @@ class FakeWS(ClientConnection):
     @override
     async def recv(self, decode: bool | None = None) -> Data:
         if not self._frames:
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
         # real websockets deliver text frames; GrokSession.ask json.loads them
         return json.dumps(self._frames.pop(0))
 
@@ -467,7 +466,7 @@ class FailoverTests(unittest.TestCase):
             patch.object(server, "pool", new=pool),
             patch.object(server, "run_session_turn", new=fake_run),
         ):
-            acc, result, events, state = asyncio.run(
+            acc, result, _events, _state = asyncio.run(
                 server.pick_account_and_turn(None, ["hi"], mode="fast", prompt="hi")
             )
 
@@ -496,11 +495,11 @@ class FailoverTests(unittest.TestCase):
         with (
             patch.object(server, "pool", new=pool),
             patch.object(server, "run_session_turn", new=fake_run),
+            self.assertRaises(Exception) as ctx,
         ):
-            with self.assertRaises(Exception) as ctx:
-                asyncio.run(
-                    server.pick_account_and_turn(None, ["hi"], mode="fast", prompt="hi")
-                )
+            asyncio.run(
+                server.pick_account_and_turn(None, ["hi"], mode="fast", prompt="hi")
+            )
         code = getattr(ctx.exception, "status_code", None)
         assert isinstance(code, int)
         self.assertEqual(code, 502)
@@ -524,11 +523,11 @@ class FailoverTests(unittest.TestCase):
         with (
             patch.object(server, "pool", new=pool),
             patch.object(server, "run_session_turn", new=fake_run),
+            self.assertRaises(Exception) as ctx,
         ):
-            with self.assertRaises(Exception) as ctx:
-                asyncio.run(
-                    server.pick_account_and_turn(None, ["hi"], mode="fast", prompt="hi")
-                )
+            asyncio.run(
+                server.pick_account_and_turn(None, ["hi"], mode="fast", prompt="hi")
+            )
 
         # every account tried exactly once — even past the old 5-attempt cap
         self.assertEqual(len(calls), 7)
@@ -561,7 +560,7 @@ class FailoverTests(unittest.TestCase):
             patch.object(server, "pool", new=pool),
             patch.object(server, "run_session_turn", new=fake_run),
         ):
-            acc, result, events, state = asyncio.run(
+            _acc, result, _events, _state = asyncio.run(
                 server.pick_account_and_turn(None, ["hi"], mode="fast", prompt="hi")
             )
 
@@ -590,16 +589,16 @@ class FailoverTests(unittest.TestCase):
         with (
             patch.object(server, "pool", new=pool),
             patch.object(server, "stream_session_turn", new=fake_stream),
+            self.assertRaises(Exception) as ctx,
         ):
-            with self.assertRaises(Exception) as ctx:
 
-                async def consume():
-                    async for _ in server.pick_account_and_stream_turn(
-                        None, ["hi"], mode="fast", prompt="hi"
-                    ):
-                        pass
+            async def consume():
+                async for _ in server.pick_account_and_stream_turn(
+                    None, ["hi"], mode="fast", prompt="hi"
+                ):
+                    pass
 
-                asyncio.run(consume())
+            asyncio.run(consume())
 
         self.assertEqual(len(calls), 6)
         self.assertEqual(len(set(calls)), 6)
@@ -640,16 +639,16 @@ class FailoverTests(unittest.TestCase):
         with (
             patch.object(server, "pool", new=pool),
             patch.object(server, "stream_session_turn", new=fake_stream),
+            self.assertRaises(Exception) as ctx,
         ):
-            with self.assertRaises(Exception) as ctx:
 
-                async def consume():
-                    async for _ in server.pick_account_and_stream_turn(
-                        "sess-key", ["hi"], mode="fast", prompt="hi"
-                    ):
-                        pass
+            async def consume():
+                async for _ in server.pick_account_and_stream_turn(
+                    "sess-key", ["hi"], mode="fast", prompt="hi"
+                ):
+                    pass
 
-                asyncio.run(asyncio.wait_for(consume(), timeout=10))
+            asyncio.run(asyncio.wait_for(consume(), timeout=10))
 
         # continuation account + the one untried account, each exactly once
         self.assertEqual(len(calls), 2)

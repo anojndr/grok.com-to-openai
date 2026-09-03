@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock, patch
 from fastapi import Request
 
 import server
-from accounts import Account, AccountPool
-from grok_gateway import GrokSession, TurnResult, RenderFilter
+from accounts import Account
+from grok_gateway import RenderFilter, TurnResult
 
 
 class FakeRequest(Request):
@@ -159,13 +159,16 @@ class RealStreamingTest(unittest.IsolatedAsyncioTestCase):
                 for block in chunk.split("\n\n"):
                     for line in block.split("\n"):
                         if line.startswith("data: "):
-                            try:
-                                payload = json.loads(line[6:])
-                                if payload.get("type") == "response.output_text.delta":
-                                    collected_deltas.append(payload["delta"])
-                                    chunk_times.append(t - start_time)
-                            except Exception:
-                                pass
+                            data = line[6:].strip()
+                            if not data or data == "[DONE]":
+                                continue
+                            payload = json.loads(data)
+                            if (
+                                isinstance(payload, dict)
+                                and payload.get("type") == "response.output_text.delta"
+                            ):
+                                collected_deltas.append(payload["delta"])
+                                chunk_times.append(t - start_time)
 
         self.assertEqual(collected_deltas, deltas)
         self.assertEqual(len(chunk_times), len(deltas))
