@@ -6,7 +6,7 @@ Turn [grok.com](https://grok.com/) free accounts into an OpenAI-compatible API u
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # edit: set PIXELVAULT_API_KEY and optionally G2O_API_KEY
+cp .env.example .env  # edit: set FREEIMAGE_API_KEY and optionally G2O_API_KEY
 python3 server.py     # serves on port 45080
 ```
 
@@ -60,7 +60,7 @@ without its files.
 ### Image Generation
 Prompts matching image-generation intent ("generate an image of...", "draw...")
 are routed to Grok's Imagine WebSocket (`wss://grok.com/ws/imagine/listen`).
-Generated images are automatically uploaded to PixelVault and returned as
+Generated images are automatically uploaded to freeimage.host and returned as
 Markdown links in the assistant response.
 
 ### Load Balancing
@@ -104,7 +104,7 @@ is appended at the end of the turn. `llmcord-go` automatically hides this append
 ## Configuration (.env)
 
 ```ini
-PIXELVAULT_API_KEY=pv_live_...   # Required for image hosting
+FREEIMAGE_API_KEY=6d...   # Required for image hosting (https://freeimage.host/page/api)
 G2O_API_KEY=                     # Optional: protect this API
 G2O_PORT=45080                   # Default port
 G2O_ACCOUNTS_FILE=accounts.txt   # Cookie file path
@@ -176,7 +176,7 @@ accounts.py        Account pool manager (round-robin, cooldown, hot-reload)
 session_store.py   SQLite persistence for multi-turn sessions, accounts, and caches
 statsig.py         x-statsig-id generator (pure Python, no browser needed)
 grok_gateway.py    WebSocket Gateway client (chat sessions)
-uploads.py         File upload v2 + PixelVault integration
+uploads.py         File upload v2 + freeimage.host integration
 config.py          Environment configuration
 ```
 

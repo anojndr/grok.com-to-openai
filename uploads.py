@@ -1,4 +1,4 @@
-"""Grok file upload (v2 presigned flow) + PixelVault image hosting."""
+"""Grok file upload (v2 presigned flow) + freeimage.host image hosting."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
 
-from config import GROK_BASE, PIXELVAULT_API_KEY, PIXELVAULT_BASE, USER_AGENT
+from config import FREEIMAGE_API_KEY, FREEIMAGE_BASE, GROK_BASE, USER_AGENT
 from statsig import StatsigGenerator
 
 
@@ -158,32 +158,71 @@ def decode_data_url(value: str) -> tuple[bytes, str | None, str]:
     return unquote_to_bytes(payload), mime, ""
 
 
-# ------------------------------------------------------------------ PixelVault
+# ------------------------------------------------------- freeimage.host (Chevereto v1)
+DEF_FREEIMAGE_BASE = "https://freeimage.host"
 
 
-async def pixelvault_upload(
+def _freeimage_api_base() -> str:
+    return (FREEIMAGE_BASE or DEF_FREEIMAGE_BASE).rstrip("/")
+
+
+def _normalize_freeimage_response(j: Any) -> dict[str, Any] | None:
+    """Map Chevereto v1 ``{'image': {...}}`` to ``{'id','url',...}``.
+    +
+    +    ``image.url`` is the viewer page; ``image.display_url`` is the direct
+    +    embeddable file. Prefer the direct URL so Markdown/API clients render it.
+    +"""
+    if not isinstance(j, dict):
+        return None
+    image = j.get("image")
+    if not isinstance(image, dict):
+        return None
+    direct = image.get("display_url") or image.get("url")
+    if not isinstance(direct, str) or not direct:
+        return None
+    viewer = image.get("url")
+    out: dict[str, Any] = dict(image)
+    out["url"] = direct
+    out["display_url"] = direct
+    if isinstance(viewer, str) and viewer:
+        out["viewer_url"] = viewer
+    if "id" not in out:
+        for key in ("id_encoded", "id", "name", "filename"):
+            val = image.get(key)
+            if isinstance(val, (str, int)) and val:
+                out["id"] = val
+                break
+    return out
+
+
+async def freeimage_upload(
     data: bytes, filename: str = "image.png", mime: str = "image/png"
 ) -> dict[str, Any]:
-    """Upload bytes to PixelVault; returns {'id','url',...}. Raises on failure."""
-    if not PIXELVAULT_API_KEY:
-        raise UploadError("PIXELVAULT_API_KEY not configured")
+    """Upload bytes to freeimage.host; returns {'id','url',...}. Raises on failure."""
+    if not FREEIMAGE_API_KEY:
+        raise UploadError("FREEIMAGE_API_KEY not configured")
+    if not data:
+        raise UploadError("freeimage upload: empty data")
     async with AsyncSession(impersonate="chrome") as s:
         from curl_cffi import CurlMime
 
         form = CurlMime()
-        form.addpart(name="file", filename=filename, content_type=mime, data=data)
+        form.addpart(name="source", filename=filename, content_type=mime, data=data)
         r = await s.post(
-            f"{PIXELVAULT_BASE}/v1/images",
-            headers={"Authorization": f"Bearer {PIXELVAULT_API_KEY}"},
+            # No trailing slash: the slashful URL 301-redirects and the
+            # redirect drops the POST body (Chrome-method rewrite).
+            f"{_freeimage_api_base()}/api/1/upload",
+            params={"key": FREEIMAGE_API_KEY, "action": "upload", "format": "json"},
             multipart=form,
             timeout=60,
         )
-        j = {}
+        j: Any = {}
         with suppress(ValueError, TypeError, AttributeError):
             j = r.json()
-        if r.status_code in (200, 201) and isinstance(j.get("data"), dict):
-            return j["data"]
-        raise UploadError(f"pixelvault {r.status_code}: {str(j)[:200]}")
+        normalized = _normalize_freeimage_response(j)
+        if r.status_code in (200, 201) and normalized is not None:
+            return normalized
+        raise UploadError(f"freeimage {r.status_code}: {str(j)[:200]}")
 
 
 def validate_public_url(url: str) -> None:
@@ -210,26 +249,29 @@ def validate_public_url(url: str) -> None:
         raise UploadError(f"DNS resolution failed for {hostname}: {e}")
 
 
-async def pixelvault_upload_from_url(url: str) -> dict[str, Any]:
-    """Server-side fetch upload: POST /v1/images {url}."""
-    if not PIXELVAULT_API_KEY:
-        raise UploadError("PIXELVAULT_API_KEY not configured")
+async def freeimage_upload_from_url(url: str) -> dict[str, Any]:
+    """Server-side fetch upload: POST Chevereto v1 {key, action, source=url}."""
+    if not FREEIMAGE_API_KEY:
+        raise UploadError("FREEIMAGE_API_KEY not configured")
     validate_public_url(url)
     async with AsyncSession(impersonate="chrome") as s:
         r = await s.post(
-            f"{PIXELVAULT_BASE}/v1/images",
-            headers={
-                "Authorization": f"Bearer {PIXELVAULT_API_KEY}",
-                "content-type": "application/json",
+            # Slashless endpoint, see freeimage_upload.
+            f"{_freeimage_api_base()}/api/1/upload",
+            data={
+                "key": FREEIMAGE_API_KEY,
+                "action": "upload",
+                "source": url,
+                "format": "json",
             },
-            json={"url": url},
             timeout=90,
         )
-        j = {}
+        j: Any = {}
         with suppress(ValueError, TypeError, AttributeError):
             j = r.json()
-        if r.status_code in (200, 201) and isinstance(j.get("data"), dict):
-            return j["data"]
+        normalized = _normalize_freeimage_response(j)
+        if r.status_code in (200, 201) and normalized is not None:
+            return normalized
         # fallback: download then direct upload
         try:
             dr = await s.get(url, timeout=60)
@@ -237,7 +279,7 @@ async def pixelvault_upload_from_url(url: str) -> dict[str, Any]:
                 raise UploadError(f"download {dr.status_code}, {len(dr.content)} bytes")
             ct = dr.headers.get("content-type", "image/png").split(";")[0]
             name = Path(url.split("?")[0]).name or "image"
-            return await pixelvault_upload(dr.content, name, ct)
+            return await freeimage_upload(dr.content, name, ct)
         except (
             OSError,
             RuntimeError,
@@ -248,5 +290,5 @@ async def pixelvault_upload_from_url(url: str) -> dict[str, Any]:
             UploadError,
         ) as e:
             raise UploadError(
-                f"pixelvault {r.status_code}: {str(j)[:160]} / download: {e}"
+                f"freeimage {r.status_code}: {str(j)[:160]} / download: {e}"
             ) from e

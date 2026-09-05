@@ -11,7 +11,7 @@ import json
 import unittest
 from collections.abc import AsyncIterable, Iterable
 from types import SimpleNamespace
-from typing import Any, Literal, overload, override
+from typing import Any, Literal, Self, overload, override
 from unittest.mock import AsyncMock, patch
 
 from websockets.asyncio.client import ClientConnection
@@ -20,9 +20,10 @@ from websockets.protocol import State
 from websockets.typing import Data, DataLike
 
 import server
+import uploads
 from accounts import Account
 from grok_gateway import GrokSession
-from uploads import UploadError
+from uploads import UploadError, _normalize_freeimage_response
 
 
 class FakePool:
@@ -54,7 +55,7 @@ class ImageHostingTests(unittest.IsolatedAsyncioTestCase):
         download = AsyncMock(return_value=(b"jpeg-bytes", "image/jpeg", "image.jpg"))
         upload = AsyncMock(
             return_value={
-                "url": "https://img.pixelvault.dev/project/image.jpg",
+                "url": "https://iili.io/image.jpg",
             }
         )
         fetch_by_url = AsyncMock(
@@ -66,14 +67,14 @@ class ImageHostingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(server, "pool", FakePool([self.other, self.owner])),
             patch.object(server, "_download_asset", download),
-            patch.object(server, "pixelvault_upload", upload),
-            patch.object(server, "pixelvault_upload_from_url", fetch_by_url),
+            patch.object(server, "freeimage_upload", upload),
+            patch.object(server, "freeimage_upload_from_url", fetch_by_url),
         ):
             result = await server.host_images(
                 [self.ASSET_URL], cookie=self.other.cookie_header()
             )
 
-        self.assertEqual(result, ["https://img.pixelvault.dev/project/image.jpg"])
+        self.assertEqual(result, ["https://iili.io/image.jpg"])
         download.assert_awaited_once_with(self.ASSET_URL, self.owner.cookie_header())
         upload.assert_awaited_once_with(b"jpeg-bytes", "image.jpg", "image/jpeg")
         fetch_by_url.assert_not_awaited()
@@ -85,12 +86,97 @@ class ImageHostingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(server, "pool", FakePool([self.owner])),
             patch.object(server, "_download_asset", download),
-            patch.object(server, "pixelvault_upload", upload),
+            patch.object(server, "freeimage_upload", upload),
         ):
             result = await server.host_images([self.ASSET_URL])
             self.assertEqual(result, [])
 
-        upload.assert_not_awaited()
+
+class FreeImageUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_normalize_prefers_direct_display_url(self):
+        out = _normalize_freeimage_response(
+            {
+                "status_code": 200,
+                "image": {
+                    "url": "https://freeimage.host/i/viewer",
+                    "display_url": "https://iili.io/direct.png",
+                    "id_encoded": "abc123",
+                },
+                "status_txt": "OK",
+            }
+        )
+        assert out is not None
+        self.assertEqual(out["url"], "https://iili.io/direct.png")
+        self.assertEqual(out["viewer_url"], "https://freeimage.host/i/viewer")
+
+    async def test_normalize_rejects_error_shape(self):
+        self.assertIsNone(
+            _normalize_freeimage_response(
+                {"status_code": 400, "error": {"message": "bad"}, "status_txt": "Bad"}
+            )
+        )
+
+    async def test_upload_posts_chevereto_fields_and_returns_direct_url(self):
+        seen: dict[str, Any] = {}
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self) -> dict[str, Any]:
+                return {
+                    "status_code": 200,
+                    "image": {
+                        "url": "https://freeimage.host/i/viewer",
+                        "display_url": "https://iili.io/direct.png",
+                    },
+                    "status_txt": "OK",
+                }
+
+        class FakeSession:
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(self, *_: object) -> bool:
+                return False
+
+            async def post(self, url: str, **kwargs: Any) -> FakeResp:
+                seen["url"] = url
+                seen["params"] = kwargs.get("params")
+                return FakeResp()
+
+        class FakeMime:
+            def __init__(self) -> None:
+                self.parts: list[dict[str, Any]] = []
+
+            def addpart(self, **kwargs: Any) -> None:
+                self.parts.append(kwargs)
+
+        fake_mime = FakeMime()
+        with (
+            patch.object(uploads, "AsyncSession", return_value=FakeSession()),
+            patch("curl_cffi.CurlMime", return_value=fake_mime),
+            patch.object(uploads, "FREEIMAGE_API_KEY", "test-key"),
+        ):
+            info = await uploads.freeimage_upload(
+                b"img-bytes", "image.png", "image/png"
+            )
+        self.assertEqual(info["url"], "https://iili.io/direct.png")
+        assert isinstance(seen.get("url"), str)
+        self.assertTrue(
+            seen["url"].endswith("/api/1/upload"),
+            f"trailing-slash URL 301s and drops the POST body: {seen['url']}",
+        )
+        assert isinstance(seen.get("params"), dict)
+        self.assertEqual(seen["params"].get("key"), "test-key")
+        self.assertEqual(seen["params"].get("action"), "upload")
+        self.assertTrue(any(p.get("name") == "source" for p in fake_mime.parts))
+
+    async def test_upload_without_key_raises(self):
+        with patch.object(uploads, "FREEIMAGE_API_KEY", ""):
+            with self.assertRaises(UploadError):
+                await uploads.freeimage_upload(b"x", "image.png", "image/png")
+            with self.assertRaises(UploadError):
+                await uploads.freeimage_upload_from_url("https://example.com/a.png")
 
 
 class GatewayAttachmentMentionTests(unittest.IsolatedAsyncioTestCase):
