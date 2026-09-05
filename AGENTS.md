@@ -30,7 +30,7 @@ Flat root, no `src/`, `docs/`, `scripts/`, `examples/`:
 - `grok_gateway.py` (823L): `GrokSession`, `TurnResult`, `GatewayError`, `RenderFilter`.
 - `accounts.py`: `Account` + `AccountPool` (cookie-block parse, hot-reload, round-robin).
 - `session_store.py`: `SqliteStore` + `clean_attachment_rows`.
-- `uploads.py`: Grok v2 presigned upload (`init→PUT→complete→poll`), `pixelvault_upload[_from_url]`, SSRF guard.
+- `uploads.py`: Grok v2 presigned upload (`init→PUT→complete→poll`), `freeimage_upload[_from_url]` (freeimage.host Chevereto v1), SSRF guard.
 - `statsig.py`: `StatsigGenerator` forging `x-statsig-id`, graceful-absent fallback.
 - `config.py`: `G2O_*` env source of truth.
 - `tests/` (9 files), `tools/capture_edit.py` (live-account debug probe, not runtime).
@@ -40,7 +40,7 @@ Flat root, no `src/`, `docs/`, `scripts/`, `examples/`:
 ```bash
 pip install -r requirements.txt   # documented quick-start
 uv sync                           # preferred when using uv (uv.lock present)
-cp .env.example .env              # then set PIXELVAULT_API_KEY, optional G2O_API_KEY
+cp .env.example .env              # then set FREEIMAGE_API_KEY, optional G2O_API_KEY
 python3 server.py                 # serve on $G2O_PORT (default 45080)
 python3 -m uvicorn server:app --host 0.0.0.0 --port "$PORT"
 ./restart.sh                      # kill .server.pid + fuser PORT, start nohup uvicorn, wait /healthz, tail server.log
@@ -81,7 +81,7 @@ async for event in stream_session_turn(sess, prompt, history_prompt, ...):
 - Runtime: Python `>=3.12` only (`pyproject.toml`, `tool.ruff target-version = py312`, `tool.ty.environment python-version = 3.12`). No Node/Bun/npm, Docker, Compose, CI, Makefile.
 - Package manager: `uv` preferred (`uv.lock` pinned, `[tool.uv] package = false` — service, not wheel); `pip install -r requirements.txt` fallback (5 unpinned deps: `curl_cffi, fastapi, uvicorn, websockets, pydantic`).
 - Server: `server:app` on uvicorn; port resolves `G2O_PORT` env → `.env` → `45080`.
-- Config: `config.py` + `.env` (`G2O_HOST/PORT/ACCOUNTS_FILE/DB_PATH/API_KEY/COOLDOWN/SESSION_TTL/MAX_SESSIONS/INCLUDE_SOURCES`, `PIXELVAULT_API_KEY/BASE`). Never commit `.env`/`accounts.txt` (see `.gitignore`); read credential structure only, never print keys.
+- Config: `config.py` + `.env` (`G2O_HOST/PORT/ACCOUNTS_FILE/DB_PATH/API_KEY/COOLDOWN/SESSION_TTL/MAX_SESSIONS/INCLUDE_SOURCES`, `FREEIMAGE_API_KEY/BASE`). Never commit `.env`/`accounts.txt` (see `.gitignore`); read credential structure only, never print keys.
 - Strict tooling (always on, no exceptions):
   > Always use `https://docs.astral.sh/uv/` with everything enabled and `https://docs.astral.sh/ty/` with everything enabled, then fix all of the issues. Make sure to actually fix all of the issues instead of suppressing them.
   - That means: `ty` with `[tool.ty.rules] all = "error"` + strict analysis + `error-on-warning`; `uv check` (ty), `uv format --check` (ruff format), `uv audit`, and `ruff check .` must ALL be clean before yielding.

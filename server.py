@@ -53,9 +53,9 @@ from statsig import (
 from uploads import (
     UploadError,
     decode_data_url,
+    freeimage_upload,
+    freeimage_upload_from_url,
     guess_mime,
-    pixelvault_upload,
-    pixelvault_upload_from_url,
     upload_file,
 )
 
@@ -1385,7 +1385,7 @@ async def host_images(urls: list[str], cookie: str = "") -> list[str]:
     """Upload image bytes to public hosting and return only public URLs.
 
     Grok assets are private to their owning account. Never hand an
-    ``assets.grok.com`` URL to the API client. If PixelVault is not configured
+    ``assets.grok.com`` URL to the API client. If freeimage.host is not configured
     or hosting fails, log a warning and return available URLs or graceful fallback.
     """
     if not urls:
@@ -1396,10 +1396,10 @@ async def host_images(urls: list[str], cookie: str = "") -> list[str]:
             asset_cookie = _asset_owner_cookie(u, cookie)
             if "assets.grok.com/users/" in u:
                 data, mime, name = await _download_asset(u, asset_cookie)
-                info = await pixelvault_upload(data, name, guess_mime(name, mime))
+                info = await freeimage_upload(data, name, guess_mime(name, mime))
             else:
                 try:
-                    info = await pixelvault_upload_from_url(u)
+                    info = await freeimage_upload_from_url(u)
                 except (
                     OSError,
                     RuntimeError,
@@ -1410,7 +1410,7 @@ async def host_images(urls: list[str], cookie: str = "") -> list[str]:
                     UploadError,
                 ):
                     data, mime, name = await _download_asset(u, asset_cookie)
-                    info = await pixelvault_upload(data, name, guess_mime(name, mime))
+                    info = await freeimage_upload(data, name, guess_mime(name, mime))
             raw_url = info.get("url") if isinstance(info, dict) else None
             if isinstance(raw_url, str) and raw_url:
                 return raw_url

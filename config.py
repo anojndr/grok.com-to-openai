@@ -32,9 +32,10 @@ DB_PATH = os.getenv("G2O_DB_PATH", str(BASE_DIR / "data" / "grok_store.db"))
 # Optional API key to protect THIS server (clients must send `Authorization: Bearer <key>`).
 API_KEY = os.getenv("G2O_API_KEY", "")
 
-# PixelVault API key for hosting generated images (never hardcode; set in .env)
-PIXELVAULT_API_KEY = os.getenv("PIXELVAULT_API_KEY", "")
-PIXELVAULT_BASE = os.getenv("PIXELVAULT_BASE", "https://api.pixelvault.dev")
+# FreeImage.host API key for hosting generated images (never hardcode; set in .env)
+# Get a key at https://freeimage.host/page/api after signing up.
+FREEIMAGE_API_KEY = os.getenv("FREEIMAGE_API_KEY", "")
+FREEIMAGE_BASE = os.getenv("FREEIMAGE_BASE", "https://freeimage.host")
 
 GROK_BASE = os.getenv("G2O_GROK_BASE", "https://grok.com")
 
