@@ -720,21 +720,17 @@ class GrokSession:
                                     else "generated"
                                 )
                         if val:
-                            if "NOTETAKER" in channel:
-                                # Only the generic placeholder indicates a slow/extra-thinking
-                                # account; legitimate edit reasoning like "adding a hat..."
-                                # must still complete (see
-                                # test_reasoning_with_generated_image_completes).
-                                # Check concatenated buffer to catch placeholder split across two deltas.
-                                if (
-                                    self.model_mode == "fast"
-                                    and "Thinking about your request"
-                                    in ("".join(reasoning) + val)
-                                ):
-                                    raise GatewayError(
-                                        "degraded",
-                                        "fast mode produced placeholder reasoning (slow account)",
-                                    )
+                            if "NOTETAKER_HEADER" in channel:
+                                # Timeline title chrome ("Thinking about your
+                                # request", "Writing a ... story"): neither answer
+                                # text nor reasoning. Live healthy fast turns
+                                # stream it, so it must not pollute reasoning
+                                # nor trip any degraded detector.
+                                continue
+                            if "THINKING" in channel or "NOTETAKER" in channel:
+                                # Thinking/summary side-channels; bare NOTETAKER
+                                # is the legacy wire name kept for old captures
+                                # (see test_reasoning_with_generated_image_completes).
                                 reasoning.append(val)
                                 yield {"type": "reasoning_delta", "text": val}
                             else:
@@ -748,15 +744,6 @@ class GrokSession:
                     elif et == "response.reasoning_text.delta":
                         d = ev.get("delta", "")
                         if d:
-                            if (
-                                self.model_mode == "fast"
-                                and "Thinking about your request"
-                                in ("".join(reasoning) + d)
-                            ):
-                                raise GatewayError(
-                                    "degraded",
-                                    "fast mode produced reasoning_text (slow account)",
-                                )
                             reasoning.append(d)
                             yield {"type": "reasoning_delta", "text": d}
                     elif et == "conversation.item.added":

@@ -686,6 +686,8 @@ MODEL_MODE_MAP = {
     "expert": "expert",
     "grok-heavy": "heavy",
     "heavy": "heavy",
+    "grok-build": "build",
+    "build": "build",
 }
 
 
@@ -2800,7 +2802,7 @@ async def models(request: Request) -> dict[str, Any]:
     check_auth(request)
     data = [
         {"id": mid, "object": "model", "created": 1700000000, "owned_by": "grok"}
-        for mid in ["grok-fast", "grok-auto", "grok-expert", "grok-heavy"]
+        for mid in ["grok-fast", "grok-auto", "grok-expert", "grok-heavy", "grok-build"]
     ]
     return {"object": "list", "data": data}
 

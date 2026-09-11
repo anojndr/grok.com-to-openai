@@ -429,6 +429,91 @@ class AskDetectionTests(unittest.TestCase):
         self.assertEqual(err.kind, "degraded")
 
 
+def header_chunk(t: str) -> dict[str, Any]:
+    return {
+        "event": {
+            "type": "response.chunk",
+            "chunk": {
+                "text": {"text": t, "channel": "CHANNEL_ASSISTANT_NOTETAKER_HEADER"},
+            },
+        }
+    }
+
+
+def thinking_chunk(t: str) -> dict[str, Any]:
+    return {
+        "event": {
+            "type": "response.chunk",
+            "chunk": {
+                "text": {"text": t, "channel": "CHANNEL_ASSISTANT_THINKING"},
+            },
+        }
+    }
+
+
+def summary_chunk(t: str) -> dict[str, Any]:
+    return {
+        "event": {
+            "type": "response.chunk",
+            "chunk": {
+                "text": {"text": t, "channel": "CHANNEL_ASSISTANT_NOTETAKER_SUMMARY"},
+            },
+        }
+    }
+
+
+class ChannelRoutingTests(unittest.TestCase):
+    PROMPT = "write a two-sentence story about a robot"
+
+    def test_header_chrome_dropped_and_turn_completes(self):
+        # Live healthy fast turns open with a NOTETAKER_HEADER title
+        # ("Thinking about your request"); it is UI chrome, not reasoning,
+        # and must not abort the turn as degraded.
+        frames = [
+            user_item(),
+            header_chunk("Thinking about your request"),
+            header_chunk("Writing a two-sentence robot story"),
+            text_chunk("ok"),
+            done_event(),
+        ]
+        out = asyncio.run(drive(make_scripted_session(frames), self.PROMPT))
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[-1]["type"], "done")
+        self.assertEqual(out[-1]["result"].text, "ok")
+        self.assertEqual(out[-1]["result"].reasoning, "")
+        kinds = [e["type"] for e in out]
+        self.assertNotIn("reasoning_delta", kinds)
+        self.assertEqual([e["text"] for e in out if e["type"] == "text_delta"], ["ok"])
+
+    def test_thinking_channel_yields_reasoning(self):
+        frames = [
+            user_item(),
+            thinking_chunk("let me think"),
+            text_chunk("hi"),
+            done_event(),
+        ]
+        out = asyncio.run(drive(make_scripted_session(frames), self.PROMPT))
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[-1]["result"].text, "hi")
+        self.assertIn("let me think", out[-1]["result"].reasoning)
+        self.assertIn(
+            "let me think",
+            [e["text"] for e in out if e["type"] == "reasoning_delta"],
+        )
+
+    def test_summary_channel_yields_reasoning(self):
+        frames = [
+            user_item(),
+            summary_chunk("key points considered"),
+            text_chunk("hi"),
+            done_event(),
+        ]
+        out = asyncio.run(drive(make_scripted_session(frames), self.PROMPT))
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[-1]["result"].text, "hi")
+        self.assertIn("key points considered", out[-1]["result"].reasoning)
+
+
 # --------------------------------------------------------------- failover
 
 
