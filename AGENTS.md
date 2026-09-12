@@ -2,101 +2,105 @@
 
 ## Project Overview
 
-OpenAI-compatible FastAPI gateway over grok.com free accounts (`wss://grok.com/ws/mgw`).
-Exposes `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models`, `GET /healthz`.
-Models: `grok-fast` (default), `grok-auto`, `grok-expert`, `grok-heavy`, `grok-build` (plus short aliases) via `MODEL_MODE_MAP`.
+Turn `grok.com` free-account cookies (`accounts.txt`) into an OpenAI-compatible API via FastAPI. Supports `POST /v1/chat/completions` + `POST /v1/responses` (stream/non-stream, attachments, image-gen, multi-turn, `previous_response_id` chaining).
+
+Entry: `python3 server.py` → `uvicorn.run(app, host=config.HOST, port=config.PORT)` (default `45080`).
 
 ## Architecture & Data Flow
 
-Single-process FastAPI app, flat top-level modules, no `src/` or DI framework.
-Module singletons in `server.py:68-72` (`app`, `store`, `pool`, `statsig`) plus `SESSIONS` (`:136`) and `SESSION_LOCK` (`:206`); collaborators passed explicitly.
+Flat-module service, no `src/` layout. `server.py` orchestrates; `grok_gateway.py` owns Grok protocol; state in module singletons (`SESSIONS` dict + `SqliteStore` + `AccountPool`), no DI framework.
 
-Chat flow (`chat_completions`: `server.py:3286`):
-`check_auth` (optional `G2O_API_KEY` Bearer) → `resolve_mode(model)` (unknown → `fast`) → `user_texts`/`content_to_text` flatten → `extract_attachments` (text vs file/image jobs) → `pick_account_and_stream_turn` (`server.py:2111`) → per-attempt `pool.acquire(exclude=tried)` → `get_or_create_session` (`:238`) → `fork_session_state` (moves live `ws` to fork, `:174`) → `stream_session_turn` (`:1646`, `TurnOptions` kwargs) → uploads via `uploads.upload_file(session, cookie, statsig, UploadPayload)` (`uploads.py:275`) with current account → `GrokSession.ask()` (`grok_gateway.py:1564`) → OpenAI SSE (`data: {...}` + `data: [DONE]`) or JSON.
-`POST /v1/responses` (`server.py:3732`) reuses same core with `previous_response_id` chaining.
+Request lifecycle (Grok → OpenAI):
 
-Gateway turn: `asyncio.Lock` per `GrokSession`; reconnect if `not alive() or ws_mode != model_mode`; send `conversation.item.create` + `response.create`; `ws.recv()` loop with session-level `idle_timeout=120s` / `max_turn_timeout=300s` (`GrokSession.__init__` keyword-only, `grok_gateway.py:1194`); abort degraded turns via `unrelated_queries()` + fast-mode placeholder heuristics.
+1. `check_auth` (Bearer vs `G2O_API_KEY`) → `_read_json_body` → `_build_chat_context()` / `_build_responses_context()`: validate messages/`input`, `extract_attachments` (splits `image_url`/`file`/`input_image`/`input_file`/data-URL/remote-URL into `flat_messages` + `file_jobs`; text inlined via `inline_textual`), `resolve_mode(model)` (`MODEL_MODE_MAP`, default `grok-fast`), `chain_key(users, auth)` + `rid_hint`.
+2. Session routing: `SESSIONS: dict[str, SessionState]` keyed by chain prefix. Hit → `fork_session_state` (live WS moves to fork, only newest message sent; gateway holds history). Miss → `_stream_fresh_turn` resends full transcript (`build_history_prompt`). SQLite mirrors checkpoints for restart recovery.
+3. Turn: `stream_session_turn` / `run_session_turn` → `GrokSession.ask` / `_stream_turn`: `_ensure_connected`, `_upload_turn_files` (`asyncio.gather`, dedupe by sha, cap 6/turn, 12 stored), `_send_turn_openers` (`session.create` + `conversation.item.create`), frame loop (`_receive_turn_frame`) → `_apply_turn_event` → `TurnResult`.
+4. Failover: `pick_account_and_turn` / `pick_account_and_stream_turn` loop `pool.acquire(exclude=tried)`; on `GatewayError` → `pool.release_fail(acc, _fail_kind(e))` + map via `_gateway_http_status` to `HTTPException`. Imagine path (`grok_generate_image`) rotates accounts independently.
+5. Render: chat SSE (`_chat_chunk` + `data: [DONE]`) / `chat.completion` JSON; responses SSE via `_ResponseEventWriter.evt`. Images hosted (`host_images` → freeimage.host) as Markdown; optional `source_appendix` when `include_sources` or `G2O_INCLUDE_SOURCES=1`.
 
-State (two tiers):
-- Memory: `SESSIONS: dict[str, SessionState]` (`server.py:136`), `SESSION_LOCK`-guarded, pruned by `SESSION_TTL=3600s` / `MAX_SESSIONS=64`.
-- SQLite `SqliteStore` (`data/grok_store.db`, WAL): `sessions` / `account_states` / `uid_cache` / `statsig_cache`; attachment cap `MAX_TRACKED_ATTACHMENTS=12`.
+Key modules:
 
-Failover: walk whole `AccountPool`, `release_fail(kind)` tiers (generic 300s, auth ≥1800s, quota → top-of-hour, degraded → 1h quarantine); commit stream on first yielded event.
+- `server.py` (~4816 lines): `app`, all routes (`chat_completions`, `responses_api`, `models`, `healthz`), context dataclasses (`_ChatContext`, `_ResponsesContext`, `_TurnRequest`), SSE renderers (`_chat_sse_frames`, `_responses_sse_frames`).
+- `grok_gateway.py`: `GrokSession` (`connect`/`close`/`alive`/`ask`/`clone_checkpoint`, per-session `lock`), `GatewayError(kind)` (`upstream|timeout|closed|degraded|auth|quota`), `TurnResult`, `RenderFilter/strip_render_tags`, `grok_generate_image`.
+- `accounts.py`: `Account` / `AccountPool` (`reload_if_changed`, `acquire`, `acquire_by_key`, `release_ok`, `release_fail`, 1h `degraded` quarantine).
+- `session_store.py`: `SqliteStore` (WAL mode, sessions/checkpoints, account states, uid + statsig caches), `MAX_TRACKED_ATTACHMENTS=12`.
+- `statsig.py`: `StatsigGenerator` (`ready`/`ensure_pair`/`generate`) for `x-statsig-id` anti-bot header.
+- `uploads.py`: `upload_file` (presigned v2), `decode_data_url`/`guess_mime`, `freeimage_upload`, SSRF guards; all-failed upload = hard error.
+- `config.py`: tiny `.env` loader + `G2O_*` defaults.
 
 ## Key Directories
 
-Flat root, no `src/`, `docs/`, `scripts/`, `examples/`:
-- `server.py` (4816L): app, 4 routes, session map, turn orchestration, SSE formatting.
-- `grok_gateway.py` (1609L): `GrokSession`, `TurnResult`, `GatewayError`, `RenderFilter`.
-- `accounts.py`: `Account` + `AccountPool` (cookie-block parse, hot-reload, round-robin).
-- `session_store.py`: `SqliteStore` + `clean_attachment_rows`.
-- `uploads.py`: Grok v2 presigned upload (`init→PUT→complete→poll`), `freeimage_upload[_from_url]` (freeimage.host Chevereto v1), SSRF guard.
-- `statsig.py`: `StatsigGenerator` forging `x-statsig-id`, graceful-absent fallback.
-- `config.py`: `G2O_*` env source of truth.
-- `tests/` (9 test files + `__init__.py`), `tools/capture_edit.py` (live-account debug probe, not runtime).
+- `/` (repo root): all runtime modules live here — no `src/`, `scripts/`, or `docs/`.
+- `tests/`: stdlib `unittest` suite (9 files, see Testing & QA).
+- `tools/`: one-off debug helpers only, e.g. `tools/capture_edit.py` (capture raw mgw frames to JSONL).
+- `data/`: gitignored SQLite runtime state (`grok_store.db*`, WAL/SHM). Do not commit.
+- Root artifacts (gitignored, runtime): `.env`, `accounts.txt`, `server.log`, `.server.pid`.
 
 ## Development Commands
 
+No build step, no Docker/CI. Direct interpreter execution.
+
 ```bash
-pip install -r requirements.txt   # documented quick-start
-uv sync                           # preferred when using uv (uv.lock present)
-cp .env.example .env              # then set FREEIMAGE_API_KEY, optional G2O_API_KEY
-python3 server.py                 # serve on $G2O_PORT (default 45080)
-python3 -m uvicorn server:app --host 0.0.0.0 --port "$PORT"
-./restart.sh                      # kill .server.pid + fuser PORT, start nohup uvicorn, wait /healthz, tail server.log
-curl -sf http://localhost:$PORT/healthz
-python3 tools/capture_edit.py [n] # live grok probe; burns quota, debug only
+pip install -r requirements.txt          # or: uv sync (uv.lock is canonical)
+cp .env.example .env                    # set FREEIMAGE_API_KEY, optionally G2O_API_KEY
+python3 server.py                       # serves on $G2O_PORT (default 45080)
+./restart.sh                            # prod-style: kills .server.pid/port owner, uvicorn server:app, waits on /healthz, tails server.log
+python3 -m uvicorn server:app --host 0.0.0.0 --port 45080
+curl -sf localhost:45080/healthz        # readiness: accounts/available/statsig_ready/sessions/degraded
+```
+
+Lint/typecheck (strict, `ruff select=["ALL"]`, `ty all="error"`):
+
+Always use https://docs.astral.sh/ruff/ with everything enabled and https://docs.astral.sh/ty/ with everything enabled, then fix all of the issues. Make sure to actually fix all of the issues instead of suppressing them.
+
+```bash
+ruff check . && ruff format --check .
+ty check
 ```
 
 ## Code Conventions & Common Patterns
 
-- `snake_case` everywhere; `from __future__ import annotations` in all modules; stdlib → third-party (`fastapi`/`curl_cffi`/`websockets`/`pytest`) → local; all imports top-level (`TYPE_CHECKING` for typing-only); no `typing.Any` in annotations (precise types or `object` + narrowing).
-- Naming: `*_key` = identity (`session_key`/`account_key`/`chain_key=sha256({auth,users})[:24]`), `*_prompt` = gateway-bound text vs `users` = raw texts; `_`-prefix = private; cross-module test seams are public (`sig_headers`, `normalize_freeimage_response`, `source_appendix`, `uid_cache`, `download_asset`, `UploadPayload`, `AccountPool.replace_accounts()`, `StatsigGenerator.seed_b64`/`.hex_digest`).
-- Async: `asyncio`-native; per-session `asyncio.Lock` spans whole turn; global `SESSION_LOCK` covers map only (never network/SQLite); `asyncio.wait_for` timeouts; `AsyncIterator` event streams (`{type, ...}` dicts).
-- Errors as narrow kinds, never blind `except Exception`: `GatewayError(kind,msg)` → `HTTPException(429 if quota else 502/503)` after exhausting accounts; parse guards catch `(ValueError, TypeError, AttributeError)` (+`RuntimeError` where the callee raises it, e.g. statsig `generate`); swallowed paths log at `debug` (`uvicorn.error`); socket/file `close()` cleanup uses `contextlib.suppress(OSError, RuntimeError, AttributeError)`; `UploadError` → drop bad data-URL or raise upstream; `400` non-string prompts, `401` bad key; per-frame narrow `except` + `debug` log, semantic abort at turn level; `release_fail(kind)` tiers (generic 300s, auth ≥1800s, quota → top-of-hour, degraded → 1h quarantine).
-- Dataclasses (`Account`/`SessionState`/`TurnResult`); sha256 attachment dedup; `RenderFilter` strips `<grok:render>` incrementally; long comments on socket hand-off, transcript resend, attachment re-mention.
-- Format: `ruff` line-length 88, `target-version = py312`, `select = ["ALL"]` + `preview = true`; `ty` strict (`all = "error"`, strict analysis, `error-on-warning = true`).
-
-Example turn driver:
-```python
-async for event in stream_session_turn(sess, prompt, **kwargs: Unpack[TurnOptions]):
-    # event: {"type": "text_delta"|"reasoning_delta"|"image_url"|"done", ...}
-```
+- Formatting: `ruff`, `target-version=py312`, `line-length=88`, `preview=true`; `isort known-first-party=["accounts","config","grok_gateway","server","session_store","statsig","uploads"]`. Google-style docstrings on everything.
+- Naming: `snake_case` funcs/vars, `CapWords` classes, `_leading_underscore` privates, `ALL_CAPS` constants (`MODEL_MODE_MAP`, TTLs); verbs `is_*`/`has_*`/`check_*`/`resolve_*`/`build_*`/`extract_*`/`persist_*`/`render_*`/`yield_*`; state holders `*_state`/`*_context`/`*_accumulator` (e.g. `SessionState`, `_ChatContext`, `_TurnState`).
+- Typing: `type JsonValue = ...` alias, `TypedDict + Unpack` for turn kwargs (`TurnOptions`, `PickOptions`), `if TYPE_CHECKING:` for `AsyncIterator`/`Mapping`/`SqliteStore`.
+- Async: `asyncio` everywhere — `curl-cffi AsyncSession` for REST, `websockets` async generators for turns/SSE (`AsyncIterator[dict|str]`), `asyncio.gather` for parallel downloads/uploads, per-session `asyncio.Lock` (`GrokSession.lock`) + global `SESSION_LOCK`, fire-and-forget via `asyncio.create_task` tracked in `_BACKGROUND_TASKS`. `SqliteStore` uses `threading.Lock` (sync SQLite under async callers); prune outside `SESSION_LOCK` to avoid blocking on disk I/O.
+- Error handling: typed `GatewayError.kind` → `_fail_kind` → pool quarantine + `_gateway_http_status` → `HTTPException("grok error (kind): msg")`. Non-stream raises; mid-SSE logs or emits `response.failed`, never aborts silently. Explicit tuples + `contextlib.suppress` on close paths. Degraded detectors (placeholder `web_search` queries, fresh-render-on-edit with attachments + zero reasoning/text) abort as `kind=degraded` → failover, 502 if all accounts degraded.
+- State: no DI framework. Module singletons: `store = SqliteStore(DB_PATH)`, `pool = AccountPool(...)`, `statsig = StatsigGenerator(store)`, `SESSIONS` dict. Per-request state in dataclasses, never globals. Add new endpoints in `server.py` (no routers package); add gateway frames in `grok_gateway.py:_apply_turn_event`; persist new state via `session_store.py`, not in-memory only.
+- Example: new turn kwarg → extend `TurnOptions` TypedDict in `server.py`, thread via `Unpack[TurnOptions]` through `pick_account_and_*` → `stream_session_turn`.
 
 ## Important Files
 
 | Path | Role |
-|------|------|
-| `server.py:68-72` | `app` entrypoint; `__main__` runs `uvicorn.run(app, host=config.HOST, port=config.PORT)` (loopback default; `restart.sh` passes `--host 0.0.0.0`) |
-| `server.py:3286,3732,4775,4794` | `chat_completions`, `responses_api`, `models`, `healthz` routes |
-| `server.py:2111,2819,1646,174,238` | `pick_account_and_stream_turn`, `pick_account_and_turn`, `stream_session_turn`, `fork_session_state`, `get_or_create_session` |
-| `grok_gateway.py:1194,1564` | `GrokSession.__init__` (session-level timeouts), `ask` |
-| `config.py` | Tiny `.env` loader + `HOST`/`PORT`/`DB_PATH`/`GROK_BASE`/`USER_AGENT`/cooldowns |
-| `accounts.txt` | Netscape cookie blocks (`account N:` headers; min `sso`, want `sso-rw,x-userid,cf_clearance`); hot-reloaded, gitignored |
-| `restart.sh` | Dev restart loop (PID + `fuser -k PORT/tcp`, `nohup uvicorn`, `/healthz` poll) |
-| `README.md` | Sole spec: endpoints, models, `.env` table, curl examples, module map |
+|---|---|
+| `server.py` | FastAPI `app`, all endpoints, translation/orchestration, SSE rendering |
+| `grok_gateway.py` | Grok mgw WS client (`GrokSession`), Imagine WS, degraded detection |
+| `accounts.py` | Round-robin `AccountPool`, cooldown/quarantine, hot-reload |
+| `session_store.py` | SQLite persistence (sessions, accounts, caches) |
+| `statsig.py` | Pure-Python `x-statsig-id` generator |
+| `uploads.py` | Presigned upload + freeimage.host |
+| `config.py` | Env config (`G2O_HOST/PORT/ACCOUNTS_FILE/DB_PATH/API_KEY/COOLDOWN/SESSION_TTL/MAX_SESSIONS/DEFAULT_MODEL/INCLUDE_SOURCES`) |
+| `pyproject.toml` | Deps (`curl-cffi,fastapi,uvicorn,websockets,pydantic`), `requires-python>=3.12`, `ruff`+`ty` config |
+| `.env.example` | Env template (`FREEIMAGE_API_KEY`, `G2O_*`) |
+| `restart.sh` | Start/stop wrapper (`.server.pid`, `server.log`, `/healthz` wait) |
+| `README.md` | Sole docs entry (quickstart, endpoints, models, accounts format) |
+| `tools/capture_edit.py` | Debug: capture image-edit gateway frames |
 
 ## Runtime/Tooling Preferences
 
-- Runtime: Python `>=3.12` only (`pyproject.toml`, `tool.ruff target-version = py312`, `tool.ty.environment python-version = 3.12`). No Node/Bun/npm, Docker, Compose, CI, Makefile.
-- Package manager: `uv` preferred (`uv.lock` pinned, `[tool.uv] package = false` — service, not wheel); `pip install -r requirements.txt` fallback (5 unpinned deps: `curl_cffi, fastapi, uvicorn, websockets, pydantic`).
-- Server: `server:app` on uvicorn; port resolves `G2O_PORT` env → `.env` → `45080`.
-- Config: `config.py` + `.env` (`G2O_HOST/PORT/ACCOUNTS_FILE/DB_PATH/API_KEY/COOLDOWN/SESSION_TTL/MAX_SESSIONS/INCLUDE_SOURCES`, `FREEIMAGE_API_KEY/BASE`). Never commit `.env`/`accounts.txt` (see `.gitignore`); read credential structure only, never print keys.
-- Strict tooling (always on, no exceptions):
-  > Always use `https://docs.astral.sh/ruff/` with everything enabled and `https://docs.astral.sh/ty/` with everything enabled, then fix all of the issues. Make sure to actually fix all of the issues instead of suppressing them.
-  - That means: `ruff check .` (`select = ["ALL"]` + preview), `ty check` (`[tool.ty.rules] all = "error"` + strict analysis + `error-on-warning`), `ruff format --check`, and `pytest` must ALL be clean before yielding.
-  - Fix, don't suppress: narrow `except Exception` to the real failure types + log (`logging.getLogger("uvicorn.error").debug/...`), use `contextlib.suppress(<narrow>)` only for close/cleanup races, never add `noqa` / `ty: ignore` / `type: ignore` / per-rule `ignore` to silence a finding. `!= 0.0`-style float equality stays spelled as threshold comparison (RUF069).
-  - Commands: `.venv/bin/python -m pytest tests/ -q`, `uv tool run ruff check .`, `ty check`, `uv tool run ruff format --check`.
+- Runtime: Python `>=3.12` only. No Bun/Node/TS toolchain (`package.json`, `tsconfig` absent).
+- Package manager: `uv` canonical (`uv.lock` + `[dependency-groups] dev`); `requirements.txt` is pip fallback mirror (runtime deps only).
+- Tooling: `ruff>=0.16.7` (lint+format), `ty>=0.0.78` (strict, `error-on-warning=true`). No pytest config — defaults apply. No Dockerfile/Compose, no `.github/` CI, no Makefile.
+- Always use codebase-memory-mcp.
 
 ## Testing & QA
 
-- Framework: `pytest` (dev dependency) over `unittest.IsolatedAsyncioTestCase` + `unittest.mock.AsyncMock/patch`; no `conftest.py`, coverage gates, or CI. Each `tests/test_*.py` keeps its `unittest.main()` footer so `python -m unittest` still works.
+- Framework: stdlib `unittest` (`unittest.TestCase`, `IsolatedAsyncioTestCase` for async/SQLite), also runnable under `pytest>=9.1.1` (dev dep). No `conftest.py`, no coverage config/gates.
+- Layout: `tests/test_degraded.py` (1219 lines, quarantine/failover), `test_include_sources.py` (appendix contract), `test_sqlite_persistence.py` (restart recovery), `test_images.py` / `test_attachment_upload.py` (upload semantics: fail-loud, partial success), `test_responses_input_text.py` (input flattening), `test_multi_turn_attachments.py` / `test_multiturn_memory.py` (cross-turn memory), `test_real_streaming.py` (SSE timing).
 - Run:
+
 ```bash
-.venv/bin/python -m pytest tests/ -q
-python3 -m unittest discover -s tests
-python3 -m unittest -v tests.test_degraded
-python3 tests/test_images.py -v
+python3 -m unittest discover -s tests -v   # full suite (or: pytest tests/ -v)
+python3 -m unittest -v tests.test_degraded  # single file (or: pytest tests/test_degraded.py -v)
 ```
-- Style: fully offline fakes — `FakeWS` scripting gateway frames (`tests/test_degraded.py:97`), temp `accounts.txt` + `pool.replace_accounts([...])`, `FakeRequest` over ASGI scope (`tests/test_sqlite_persistence.py:36`); temp SQLite via `tempfile.mkdtemp()` + `addCleanup(shutil.rmtree, ...)`; `test_real_streaming.py` is mocked despite name. Assertions use `if <negated>: pytest.fail(...)` (no `assert` keyword per S101) and `pytest.raises`; narrow `JSONResponse | StreamingResponse` with `isinstance(resp, StreamingResponse)` and normalize chunks (`str` stays, else `bytes(chunk).decode()`).
-- Lint/typecheck: `ruff check .`, `ty check` (strict, error-on-warning). Keep both green: small documented helpers, Google-style docstrings with Args/Returns/Raises, `*_args: object` / `**_kwargs: object` on fakes, `await asyncio.sleep(0)` in awaited async fakes, `ClassVar` for mutable class constants, `await asyncio.to_thread(...)` for blocking IO in async tests.
+
+- Conventions: per-file `Run: python3 -m unittest -v tests.test_<name>` docstring + `unittest.main()` footer; self-contained mocks of gateway frames/uploads, no shared fixtures (`tests/__init__.py` is marker only). Failing upload-all = error assertion, never silent drop — preserve this invariant in new tests.
