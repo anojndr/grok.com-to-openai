@@ -1,3 +1,4 @@
+# Copyright (c) 2026 grok-to-openai-api contributors.
 """Account pool: parse accounts.txt, hot-reload, round-robin load balancing.
 
 accounts.txt format: blocks of Netscape cookie files separated by optional
@@ -14,6 +15,10 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from session_store import SqliteStore
 
 BLOCK_SPLIT = re.compile(r"(?m)^account\s+\d+:\s*$")
 INTERESTING_COOKIES = {
@@ -24,23 +29,44 @@ INTERESTING_COOKIES = {
     "x-userid",
     "grok_device_id",
 }
+_COOKIE_FIELD_COUNT = 7
+
+
+def _as_float(value: object, default: float) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return default
+
+
+def _as_int(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
 
 
 @dataclass
 class Account:
+    """One Grok account backed by browser cookies.
+
+    Attributes:
+        index: 1-based position in accounts.txt.
+        cookies: Cookie name to value mapping.
+        user_id: Gateway user id from the x-userid cookie.
+        cooldown_until: Epoch seconds when failure cooldown ends.
+        degraded_until: Epoch seconds when degraded quarantine ends.
+        in_flight: Number of requests currently using the account.
+        total_requests: Lifetime request count.
+        failed_requests: Lifetime failure count.
+
+    """
+
     index: int
     cookies: dict[str, str]
     user_id: str = ""
-
-    @property
-    def key(self) -> str:
-        uid = self.cookies.get("x-userid", "")
-        if uid:
-            return "u:" + uid
-        return (
-            "s:" + hashlib.sha256(self.cookies.get("sso", "").encode()).hexdigest()[:24]
-        )
-
     cooldown_until: float = 0.0
     degraded_until: float = 0.0
     in_flight: int = 0
@@ -48,20 +74,61 @@ class Account:
     failed_requests: int = 0
 
     @property
+    def key(self) -> str:
+        """Stable identity key for this account.
+
+        Returns:
+            The user-id key, or an SSO hash key when id is absent.
+
+        """
+        uid = self.cookies.get("x-userid", "")
+        if uid:
+            return "u:" + uid
+        digest = hashlib.sha256(self.cookies.get("sso", "").encode())
+        return "s:" + digest.hexdigest()[:24]
+
+    @property
     def degraded(self) -> bool:
+        """Degraded-quarantine state of the account.
+
+        Returns:
+            True while the quarantine deadline is in the future.
+
+        """
         return time.time() < self.degraded_until
 
     @property
     def sso(self) -> str:
+        """SSO cookie value used for upstream auth.
+
+        Returns:
+            The session cookie used for upstream auth.
+
+        """
         return self.cookies.get("sso", "")
 
     def cookie_header(self, extra: dict[str, str] | None = None) -> str:
+        """Build the Cookie header from interesting cookies plus extras.
+
+        Args:
+            extra: Additional cookies merged over the jar.
+
+        Returns:
+            The semicolon-joined Cookie header value.
+
+        """
         jar = {k: v for k, v in self.cookies.items() if k in INTERESTING_COOKIES}
         if extra:
             jar.update(extra)
         return "; ".join(f"{k}={v}" for k, v in jar.items())
 
     def available(self) -> bool:
+        """Return whether the account can serve traffic right now.
+
+        Returns:
+            True when an SSO cookie exists and no deadline blocks it.
+
+        """
         return (
             bool(self.sso)
             and time.time() >= self.cooldown_until
@@ -69,12 +136,40 @@ class Account:
         )
 
     def mark_failed(self, cooldown: float) -> None:
+        """Record one failure and extend the cooldown deadline.
+
+        Args:
+            cooldown: Seconds to keep the account out of rotation.
+
+        """
         self.failed_requests += 1
         self.cooldown_until = max(self.cooldown_until, time.time() + cooldown)
 
 
 class AccountPool:
-    def __init__(self, path: str | Path, cooldown_seconds: int = 300, store=None):
+    """Round-robin pool with hot-reload and failure quarantines.
+
+    Attributes:
+        path: Location of accounts.txt on disk.
+        cooldown_seconds: Cooldown applied after generic failures.
+        store: Optional persistent store for account states.
+
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        cooldown_seconds: int = 300,
+        store: SqliteStore | None = None,
+    ) -> None:
+        """Create a pool that hot-reloads accounts from disk.
+
+        Args:
+            path: Path to accounts.txt.
+            cooldown_seconds: Cooldown applied after generic failures.
+            store: Optional persistent store for account states.
+
+        """
         self.path = Path(path)
         self.cooldown_seconds = cooldown_seconds
         self.store = store
@@ -84,6 +179,7 @@ class AccountPool:
         self._lock = asyncio.Lock()
 
     async def reload_if_changed(self) -> None:
+        """Reload accounts.txt when its mtime changed, keeping runtime state."""
         try:
             mtime = self.path.stat().st_mtime
         except OSError:
@@ -106,10 +202,10 @@ class AccountPool:
                     acc.failed_requests = old.failed_requests
                 elif acc.key in stored_states:
                     st = stored_states[acc.key]
-                    acc.cooldown_until = st.get("cooldown_until", 0.0)
-                    acc.degraded_until = st.get("degraded_until", 0.0)
-                    acc.total_requests = st.get("total_requests", 0)
-                    acc.failed_requests = st.get("failed_requests", 0)
+                    acc.cooldown_until = _as_float(st.get("cooldown_until"), 0.0)
+                    acc.degraded_until = _as_float(st.get("degraded_until"), 0.0)
+                    acc.total_requests = _as_int(st.get("total_requests"), 0)
+                    acc.failed_requests = _as_int(st.get("failed_requests"), 0)
             self._accounts = new_accounts
             self._mtime = mtime
 
@@ -124,17 +220,17 @@ class AccountPool:
             blocks = [raw]
         accounts: list[Account] = []
         n = 0
-        for block in blocks:
-            block = block.strip()
-            if not block or "sso" not in block and "\t" not in block:
+        for raw_block in blocks:
+            block = raw_block.strip()
+            if not block or ("sso" not in block and "\t" not in block):
                 continue
             cookies: dict[str, str] = {}
-            for line in block.splitlines():
-                line = line.strip()
+            for raw_line in block.splitlines():
+                line = raw_line.strip()
                 if not line or line.startswith("#"):
                     continue
                 parts = line.split("\t")
-                if len(parts) >= 7:
+                if len(parts) >= _COOKIE_FIELD_COUNT:
                     name, value = parts[5].strip(), parts[6].strip()
                     if name in INTERESTING_COOKIES:
                         cookies[name] = value
@@ -146,15 +242,33 @@ class AccountPool:
                     index=n,
                     cookies=cookies,
                     user_id=cookies.get("x-userid", ""),
-                )
+                ),
             )
         return accounts
 
     def snapshot(self) -> list[Account]:
+        """Return a copy of the current account list.
+
+        Returns:
+            The accounts known to the pool in load order.
+
+        """
         return list(self._accounts)
 
+    def replace_accounts(self, accounts: list[Account]) -> None:
+        """Replace the in-memory account list, mainly for tests.
+
+        Args:
+            accounts: Accounts forming the new pool contents.
+
+        """
+        self._accounts = list(accounts)
+
     def acquire(
-        self, exclude: set[str] | None = None, include_degraded: bool = False
+        self,
+        exclude: set[str] | None = None,
+        *,
+        include_degraded: bool = False,
     ) -> Account | None:
         """Pick the next account to serve a request.
 
@@ -165,6 +279,14 @@ class AccountPool:
         last-resort pool when `include_degraded` is set (turn failover sets
         it so every account is tried before surfacing an error — the
         degraded-turn detector still aborts a bad turn before it completes).
+
+        Args:
+            exclude: Account keys that must not be handed out.
+            include_degraded: Admit degraded accounts to last-resort pool.
+
+        Returns:
+            The chosen account, or None when every account is excluded.
+
         """
         exclude = exclude or set()
         candidates = [a for a in self._accounts if a.sso and a.key not in exclude]
@@ -196,6 +318,15 @@ class AccountPool:
         return acc
 
     def acquire_by_key(self, key: str) -> Account | None:
+        """Hand out one available account by identity key.
+
+        Args:
+            key: Account identity key to look up.
+
+        Returns:
+            The matching available account, or None when absent or busy.
+
+        """
         acc = next((a for a in self._accounts if a.key == key), None)
         if acc and acc.available():
             acc.total_requests += 1
@@ -211,6 +342,12 @@ class AccountPool:
         return None
 
     def release_ok(self, acc: Account) -> None:
+        """Clear failure cooldown after a successful request.
+
+        Args:
+            acc: Account that served the request successfully.
+
+        """
         acc.cooldown_until = 0.0
         if self.store:
             self.store.save_account_state(
@@ -222,6 +359,13 @@ class AccountPool:
             )
 
     def release_fail(self, acc: Account, kind: str = "generic") -> None:
+        """Quarantine an account after a failed request.
+
+        Args:
+            acc: Account that served the failed request.
+            kind: Failure class (auth, quota, degraded, or generic).
+
+        """
         cooldown = self.cooldown_seconds
         if kind == "auth":
             cooldown = max(cooldown, 1800)
