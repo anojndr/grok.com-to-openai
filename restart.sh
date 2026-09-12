@@ -40,30 +40,73 @@ fi
 # also kill anything bound to the port
 if command -v fuser &>/dev/null; then
     fuser -k "$PORT"/tcp 2>/dev/null || true
-    sleep 0.5
 fi
 
-# ── Start ────────────────────────────────────────────────────────────────────
-echo "Starting server on port $PORT..."
-cd "$DIR"
-nohup python3 -m uvicorn server:app --host 0.0.0.0 --port "$PORT" \
-    >> "$LOG_FILE" 2>&1 &
-echo $! > "$PID_FILE"
-
-# ── Wait for readiness ───────────────────────────────────────────────────────
+# Wait until the port is actually free. Starting uvicorn while the old
+# process still holds the port fails with "[Errno 98] address already in
+# use" and leaves a stale .server.pid behind with nothing listening.
 for _ in $(seq 1 30); do
-    if curl -sf "$BASE_URL/healthz" >/dev/null 2>&1; then
-        break
+    if command -v ss &>/dev/null; then
+        ss -tln 2>/dev/null | grep -qE "[:.]$PORT([[:space:]]|$)" || break
+    else
+        (echo > /dev/tcp/127.0.0.1/"$PORT") 2>/dev/null || break
     fi
     sleep 0.5
 done
-
-if curl -sf "$BASE_URL/healthz" >/dev/null 2>&1; then
-    echo "✓ Server is up: $BASE_URL"
-else
-    echo "✗ Server may not be ready yet — check $LOG_FILE"
+if command -v ss &>/dev/null; then
+    if ss -tln 2>/dev/null | grep -qE "[:.]$PORT([[:space:]]|$)"; then
+        echo "✗ Port $PORT still bound after stop — refusing to start a doomed process. Check $LOG_FILE" >&2
+        exit 1
+    fi
+elif (echo > /dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+    echo "✗ Port $PORT still bound after stop — refusing to start a doomed process. Check $LOG_FILE" >&2
+    exit 1
 fi
 
+ # ── Start ────────────────────────────────────────────────────────────────────
+ echo "Starting server on port $PORT..."
+ cd "$DIR"
+nohup python3 -m uvicorn server:app --host 0.0.0.0 --port "$PORT" \
+    >> "$LOG_FILE" 2>&1 &
+START_PID=$!
+echo "$START_PID" > "$PID_FILE"
+ 
+ # ── Wait for readiness ───────────────────────────────────────────────────────
+ for _ in $(seq 1 30); do
+     if curl -sf "$BASE_URL/healthz" >/dev/null 2>&1; then
+         break
+     fi
+     sleep 0.5
+ done
+ 
+if ! curl -sf "$BASE_URL/healthz" >/dev/null 2>&1; then
+    echo "✗ Server did not become ready — check $LOG_FILE" >&2
+    tail -n 20 "$LOG_FILE" >&2 || true
+    kill "$START_PID" 2>/dev/null || true
+    sleep 1
+    kill -9 "$START_PID" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    exit 1
+fi
+echo "✓ Server is up: $BASE_URL"
+
+# $! can be a wrapper subshell (nohup+redirect double-fork), not the uvicorn
+# process itself. Record the pid that actually holds the port so the pid
+# file never points at a dead process while the server runs (or vice versa).
+if command -v ss &>/dev/null; then
+    LISTENER_PID=$(ss -tlnp 2>/dev/null | grep -E "[:.]$PORT([[:space:]]|$)" | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+    if [ -n "${LISTENER_PID:-}" ] && kill -0 "$LISTENER_PID" 2>/dev/null; then
+        LISTENER_CMD=$(tr '\0' ' ' < "/proc/$LISTENER_PID/cmdline" 2>/dev/null || true)
+        if echo "$LISTENER_CMD" | grep -qE "uvicorn|server:app"; then
+            echo "$LISTENER_PID" > "$PID_FILE"
+        fi
+    fi
+fi
+if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "✗ Pid file points at a dead process — check $LOG_FILE" >&2
+    rm -f "$PID_FILE"
+    exit 1
+fi
 echo ""
 echo "─────────────────────────────────────────────"
 echo "  Base URL:  $BASE_URL"
