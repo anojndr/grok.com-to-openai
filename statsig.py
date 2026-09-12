@@ -1,3 +1,4 @@
+# Copyright (c) 2026 grok-to-openai-api contributors.
 """Pure-Python x-statsig-id generator for grok.com REST endpoints.
 
 Algorithm (reversed & byte-exact verified against grok's JS):
@@ -32,25 +33,66 @@ import re
 import sqlite3
 import struct
 import time
-from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Sequence
+
+    from session_store import SqliteStore
 
 STATSIG_EPOCH = 1682924400  # 0x644f6370
 SALT = "obfiowerehiring"
 MARK = 0x03
+_PAIR_TTL_SECONDS = 1800
+_MIN_SEED_BYTES = 48
+_BEZIER_TOLERANCE = 1e-7
+_MIN_SEGMENT_VALUES = 11
+
+# Dash variants matched in the verification meta name, written as escapes so
+# the source stays ASCII-only (U+2010..U+2015 plus hyphen-minus).
+_DASH_CLASS = r"[\u2010\u2011\u2012\u2013\u2014\u2015-]"
+_META_BEFORE_RE = re.compile(
+    rf"<meta[^>]*name=[\"']grok{_DASH_CLASS}site{_DASH_CLASS}"
+    rf"verification[\"'][^>]*content=[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+_META_AFTER_RE = re.compile(
+    rf"content=[\"']([^\"']+)[\"'][^>]*name=[\"']grok{_DASH_CLASS}"
+    rf"site{_DASH_CLASS}verification[\"']",
+    re.IGNORECASE,
+)
 
 
-# ---------------------------------------------------------------- hex helpers
+class _CurveSegment(TypedDict):
+    color: Sequence[object]
+    deg: object
+    bezier: Sequence[object]
 
 
 def js_round(x: float) -> int:
-    """JS Math.round() rounds half towards positive infinity (e.g. 2.5 -> 3, -2.5 -> -2)."""
+    """Round half towards positive infinity like JS Math.round().
+
+    Args:
+        x: Value to round.
+
+    Returns:
+        The rounded integer.
+
+    """
     return math.floor(x + 0.5)
 
 
 def js_num_to_hex(v: float) -> str:
-    """JS Number.prototype.toString(16) matching IEEE-754 double precision."""
-    if v == 0.0:
+    """Format a float like JS Number.prototype.toString(16).
+
+    Args:
+        v: Value to format with IEEE-754 double precision.
+
+    Returns:
+        The lowercase hexadecimal representation.
+
+    """
+    if not v:
         return "-0" if math.copysign(1.0, v) < 0 else "0"
     neg = v < 0
     v = abs(v)
@@ -75,6 +117,16 @@ def js_num_to_hex(v: float) -> str:
 
 
 def js_to_fixed(v: float, prec: int = 2) -> float:
+    """Round to fixed decimals like JS Number.prototype.toFixed().
+
+    Args:
+        v: Value to round.
+        prec: Decimals kept after rounding.
+
+    Returns:
+        The rounded float.
+
+    """
     p: int = int(10**prec)
     return float(js_round(v * p)) / float(p)
 
@@ -88,6 +140,19 @@ def _sample_cubic_derivative(t: float, a1: float, a2: float) -> float:
 
 
 def cubic_bezier_y(x1: float, y1: float, x2: float, y2: float, x: float) -> float:
+    """Evaluate a cubic bezier curve at horizontal position x.
+
+    Args:
+        x1: First control point x.
+        y1: First control point y.
+        x2: Second control point x.
+        y2: Second control point y.
+        x: Horizontal position in the unit interval.
+
+    Returns:
+        The curve y value at x.
+
+    """
     if x <= 0:
         return 0.0
     if x >= 1:
@@ -95,17 +160,17 @@ def cubic_bezier_y(x1: float, y1: float, x2: float, y2: float, x: float) -> floa
     t = x
     for _ in range(8):
         x_at_t = _sample_cubic(t, x1, x2) - x
-        if abs(x_at_t) < 1e-7:
+        if abs(x_at_t) < _BEZIER_TOLERANCE:
             return _sample_cubic(t, y1, y2)
         d = _sample_cubic_derivative(t, x1, x2)
-        if abs(d) < 1e-7:
+        if abs(d) < _BEZIER_TOLERANCE:
             break
         t -= x_at_t / d
     lo, hi = 0.0, 1.0
     t = x
     while lo < hi:
         x_at_t = _sample_cubic(t, x1, x2)
-        if abs(x_at_t - x) < 1e-7:
+        if abs(x_at_t - x) < _BEZIER_TOLERANCE:
             return _sample_cubic(t, y1, y2)
         if x > x_at_t:
             lo = t
@@ -119,106 +184,133 @@ def _extract_numbers(seg: str) -> list[float]:
     return [float(m.group(0)) for m in re.finditer(r"-?\d+\.?\d*", seg)]
 
 
-def compute_animation_hex(svg_path_d: str, seed: bytes) -> str:
-    if len(seed) < 48:
-        raise ValueError("seed must be at least 48 bytes")
+def _select_curve_segment(svg_path_d: str, seed: bytes) -> list[float]:
     segments: list[list[float]] = []
     for part in svg_path_d[9:].split("C"):
         nums = _extract_numbers(part)
         if nums:
             segments.append(nums)
     if not segments:
-        raise ValueError("no segments found in svg_path_d")
+        msg = "no segments found in svg_path_d"
+        raise ValueError(msg)
     seg_idx = seed[5] % len(segments)
     seg = segments[seg_idx]
-    if len(seg) < 11:
-        raise ValueError(f"segment {seg_idx} has fewer than 11 values")
-    start_color = seg[0:3]
-    end_color = seg[3:6]
+    if len(seg) < _MIN_SEGMENT_VALUES:
+        msg = f"segment {seg_idx} has fewer than 11 values"
+        raise ValueError(msg)
+    return seg
 
+
+def _bezier_control_points(seg: list[float]) -> tuple[float, float, float, float]:
+    def scale(n: float, low: float, high: float) -> float:
+        return js_to_fixed(n * ((high - low) / 255) + low, 2)
+
+    return (
+        scale(seg[7], 0, 1),
+        scale(seg[8], -1, 1),
+        scale(seg[9], 0, 1),
+        scale(seg[10], -1, 1),
+    )
+
+
+def _fingerprint_values(seg: list[float], progress: float) -> list[float]:
+    def channel(start: float, end: float) -> int:
+        value = js_round(start + (end - start) * progress)
+        return max(0, min(255, int(value)))
+
+    red = channel(seg[0], seg[3])
+    green = channel(seg[1], seg[4])
+    blue = channel(seg[2], seg[5])
     end_angle = math.floor(seg[6] * ((360 - 60) / 255) + 60)
+    angle = end_angle * progress * math.pi / 180
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    values = [float(red), float(green), float(blue)]
+    values.extend([cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0])
+    return values
 
-    def sv(n: float, mn: float, mx: float) -> float:
-        return js_to_fixed(n * ((mx - mn) / 255) + mn, 2)
 
-    x1 = sv(seg[7], 0, 1)
-    y1 = sv(seg[8], -1, 1)
-    x2 = sv(seg[9], 0, 1)
-    y2 = sv(seg[10], -1, 1)
+def compute_animation_hex(svg_path_d: str, seed: bytes) -> str:
+    """Compute the SVG-animation fingerprint hex for one seed.
 
+    Args:
+        svg_path_d: Combined SVG path data for the selected curves.
+        seed: Random seed bytes of at least 48 entries.
+
+    Returns:
+        The hex fingerprint with dots and dashes stripped.
+
+    Raises:
+        ValueError: If the seed is short or the path has no segments.
+
+    """
+    if len(seed) < _MIN_SEED_BYTES:
+        msg = "seed must be at least 48 bytes"
+        raise ValueError(msg)
+    seg = _select_curve_segment(svg_path_d, seed)
+    x1, y1, x2, y2 = _bezier_control_points(seg)
     seek = js_round(((seed[24] % 16) * (seed[22] % 16) * (seed[23] % 16)) / 10) * 10
     progress = cubic_bezier_y(x1, y1, x2, y2, seek / 4096.0)
-
-    def chan(s: float, e: float) -> int:
-        v = js_round(s + (e - s) * progress)
-        return max(0, min(255, int(v)))
-
-    r = chan(start_color[0], end_color[0])
-    g = chan(start_color[1], end_color[1])
-    b = chan(start_color[2], end_color[2])
-    angle = end_angle * progress * math.pi / 180
-    c, s_ = math.cos(angle), math.sin(angle)
-    values = [float(r), float(g), float(b), c, s_, -s_, c, 0.0, 0.0]
+    values = _fingerprint_values(seg, progress)
     buf = "".join(js_num_to_hex(js_to_fixed(v, 2)) for v in values)
     return re.sub(r"[.\-]", "", buf)
 
 
-def curves_to_path(curve_segs: list[dict[str, Any]]) -> str:
+def curves_to_path(curve_segs: list[_CurveSegment]) -> str:
+    """Render curve segments as one SVG path definition.
+
+    Args:
+        curve_segs: Curve segments with color stops and handles.
+
+    Returns:
+        The combined SVG path data string.
+
+    """
     pieces = [
-        f" {e['color'][0]},{e['color'][1]} {e['color'][2]},{e['color'][3]} "
-        f"{e['color'][4]},{e['color'][5]} h {e['deg']} s "
-        f"{e['bezier'][0]},{e['bezier'][1]} {e['bezier'][2]},{e['bezier'][3]}"
-        for e in curve_segs
+        f" {entry['color'][0]},{entry['color'][1]}"
+        f" {entry['color'][2]},{entry['color'][3]}"
+        f" {entry['color'][4]},{entry['color'][5]}"
+        f" h {entry['deg']} s"
+        f" {entry['bezier'][0]},{entry['bezier'][1]}"
+        f" {entry['bezier'][2]},{entry['bezier'][3]}"
+        for entry in curve_segs
     ]
     return "M 10,30 C" + " C".join(pieces)
 
 
-# ------------------------------------------------------------ html extraction
-
-
 def extract_meta_seed(html: str) -> str | None:
-    # meta name uses a unicode dash; normalize any dash variant
-    m = re.search(
-        r'<meta[^>]*name=["\']grok[‐‑‒–—―-]site[‐‑‒–—―-]verification["\'][^>]*content=["\']([^"\']+)["\']',
-        html,
-        re.IGNORECASE,
-    )
-    if not m:
-        m = re.search(
-            r'content=["\']([^"\']+)["\'][^>]*name=["\']grok[‐‑‒–—―-]site[‐‑‒–—―-]verification["\']',
-            html,
-            re.IGNORECASE,
-        )
-    if not m:
+    """Extract the base64 statsig seed from the page meta tag.
+
+    Args:
+        html: Page HTML that may embed the verification meta tag.
+
+    Returns:
+        The seed string, or None when the tag is absent.
+
+    """
+    match = _META_BEFORE_RE.search(html)
+    if match is None:
+        match = _META_AFTER_RE.search(html)
+    if match is None:
         return None
-    val = m.group(1)
+    val = match.group(1)
     return val if isinstance(val, str) else None
 
 
-def extract_curves(html: str) -> list[Any] | None:
-    marker = '\\"curves\\":['
-    i = html.find(marker)
-    escaped = True
-    if i < 0:
-        marker = '"curves":['
-        i = html.find(marker)
-        escaped = False
-        if i < 0:
-            return None
-    blob = html.replace('\\"', '"') if escaped else html
-    open_marker = '"curves":['
-    i = blob.find(open_marker)
-    if i < 0:
-        return None
-    # start must point at the '[' of the UNESCAPED marker; using the escaped
-    # marker's length here skipped two chars and corrupted the extracted array.
-    start = i + len(open_marker) - 1
+def _normalized_curves_blob(html: str) -> str | None:
+    if html.find('\\"curves\\":[') >= 0:
+        return html.replace('\\"', '"')
+    if html.find('"curves":[') >= 0:
+        return html
+    return None
+
+
+def _scan_array_end(blob: str, start: int) -> int:
     depth = 0
-    j = start
     instr = False
     esc = False
-    while j < len(blob):
-        ch = blob[j]
+    pos = start
+    while pos < len(blob):
+        ch = blob[pos]
         if instr:
             if esc:
                 esc = False
@@ -226,51 +318,143 @@ def extract_curves(html: str) -> list[Any] | None:
                 esc = True
             elif ch == '"':
                 instr = False
-        else:
-            if ch == '"':
-                instr = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if not depth:
-                    break
-        j += 1
-    raw = blob[start : j + 1]
-    d2 = 0
+        elif ch == '"':
+            instr = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if not depth:
+                break
+        pos += 1
+    return pos
+
+
+def _trim_balanced_array(raw: str) -> str:
+    depth = 0
     end = None
-    in2 = False
-    e2 = False
-    for k, ch in enumerate(raw):
-        if in2:
-            if e2:
-                e2 = False
+    in_string = False
+    escaped = False
+    for pos, ch in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
             elif ch == "\\":
-                e2 = True
+                escaped = True
             elif ch == '"':
-                in2 = False
-        else:
-            if ch == '"':
-                in2 = True
-            elif ch == "[":
-                d2 += 1
-            elif ch == "]":
-                d2 -= 1
-                if not d2:
-                    end = k + 1
-                    break
-    trimmed = raw[:end] if end else raw
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if not depth:
+                end = pos + 1
+                break
+    return raw[:end] if end else raw
+
+
+def extract_curves(html: str) -> list[object] | None:
+    """Extract the decoded curves array from page HTML.
+
+    Args:
+        html: Page HTML that may embed the curves payload.
+
+    Returns:
+        The decoded curves array, or None when absent or malformed.
+
+    """
+    blob = _normalized_curves_blob(html)
+    if blob is None:
+        return None
+    # Start must point at the '[' of the UNESCAPED marker; using the escaped
+    # marker's length here skipped two chars and corrupted the extracted array.
+    open_marker = '"curves":['
+    at = blob.find(open_marker)
+    if at < 0:
+        return None
+    start = at + len(open_marker) - 1
+    end = _scan_array_end(blob, start)
+    trimmed = _trim_balanced_array(blob[start : end + 1])
     try:
-        return json.loads(trimmed)
+        decoded = json.loads(trimmed)
     except (ValueError, TypeError, AttributeError):
         return None
+    if not isinstance(decoded, list):
+        return None
+    items: list[object] = []
+    items.extend(decoded)
+    return items
 
 
-# ------------------------------------------------------------------ generator
+def _as_curve_list(value: object) -> list[_CurveSegment] | None:
+    if not isinstance(value, list):
+        return None
+    segments: list[_CurveSegment] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            return None
+        color = entry.get("color")
+        bezier = entry.get("bezier")
+        if not isinstance(color, list) or not isinstance(bezier, list):
+            return None
+        if "deg" not in entry:
+            return None
+        segments.append(
+            {"color": color, "deg": entry.get("deg"), "bezier": bezier},
+        )
+    return segments
+
+
+def _decode_seed_page(html: str | None) -> tuple[bytes, str, list[object]] | None:
+    if not html:
+        return None
+    seed_b64 = extract_meta_seed(html)
+    curves = extract_curves(html)
+    if not seed_b64 or not curves:
+        return None
+    try:
+        seed = base64.b64decode(seed_b64 + "==")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return seed, seed_b64, curves
+
+
+def _hex_for_seed(
+    seed: bytes,
+    seed_b64: str,
+    curves: list[object],
+) -> tuple[str, str] | None:
+    if len(curves) == 0 or len(seed) < _MIN_SEED_BYTES:
+        return None
+    idx = seed[5] % len(curves)
+    segments = _as_curve_list(curves[idx])
+    if segments is None:
+        return None
+    try:
+        path_d = curves_to_path(segments)
+        computed_hex = compute_animation_hex(path_d, seed)
+    except (ValueError, TypeError, AttributeError, IndexError, KeyError):
+        return None
+    return seed_b64, computed_hex
 
 
 class StatsigGenerator:
-    def __init__(self, store=None):
+    """Generate x-statsig-id header values with an auto-refreshing pair.
+
+    Attributes:
+        store: Optional persistent cache for the seed pair.
+
+    """
+
+    def __init__(self, store: SqliteStore | None = None) -> None:
+        """Load the cached pair when a store is provided.
+
+        Args:
+            store: Optional persistent cache for the seed pair.
+
+        """
         self._seed_b64: str | None = None
         self._seed_bytes: bytes | None = None
         self._hex: str | None = None
@@ -290,115 +474,156 @@ class StatsigGenerator:
                 self._hex = h_str
                 self._fetched_at = f_at
 
-    async def ensure_pair(
-        self, fetch_page: Callable[[], Awaitable[str | None]]
-    ) -> tuple[str, str]:
-        """fetch_page: async callable () -> html text of grok.com/index."""
-        # Fast path without lock
-        if self._hex and time.time() - self._fetched_at < 1800:
+    @property
+    def seed_b64(self) -> str | None:
+        """Cached base64 seed, or None before the first fetch.
+
+        Returns:
+            The seed string, or None when no pair is cached.
+
+        """
+        return self._seed_b64
+
+    @property
+    def hex_digest(self) -> str | None:
+        """Cached animation fingerprint hex, or None before fetching.
+
+        Returns:
+            The hex string, or None when no pair is cached.
+
+        """
+        return self._hex
+
+    def _fresh_pair(self) -> tuple[str, str] | None:
+        if self._hex and time.time() - self._fetched_at < _PAIR_TTL_SECONDS:
             seed_b64 = self._seed_b64
             hex_ = self._hex
             if seed_b64 and hex_:
                 return seed_b64, hex_
+        return None
+
+    async def _do_fetch(
+        self,
+        fetch_page: Callable[[], Awaitable[str | None]],
+    ) -> tuple[str, str] | None:
+        try:
+            html = await fetch_page()
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            TimeoutError,
+        ) as err:
+            logging.getLogger("uvicorn.error").debug(
+                "statsig page fetch failed: %s",
+                err,
+            )
+            html = None
+        decoded = _decode_seed_page(html)
+        if decoded is None:
+            return None
+        seed, seed_b64, curves = decoded
+        pair = _hex_for_seed(seed, seed_b64, curves)
+        if pair is None:
+            return None
+        return await self._publish_pair(seed, seed_b64, pair[1])
+
+    async def _publish_pair(
+        self,
+        seed: bytes,
+        seed_b64: str,
+        computed_hex: str,
+    ) -> tuple[str, str]:
+        async with self._lock:
+            if self._hex and time.time() - self._fetched_at < _PAIR_TTL_SECONDS:
+                cached_seed = self._seed_b64
+                cached_hex = self._hex
+                if cached_seed and cached_hex:
+                    return cached_seed, cached_hex
+            self._seed_b64 = seed_b64
+            self._seed_bytes = seed
+            self._hex = computed_hex
+            self._fetched_at = time.time()
+            if self.store:
+                try:
+                    self.store.set_statsig(seed_b64, computed_hex, self._fetched_at)
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    sqlite3.Error,
+                ) as err:
+                    logging.getLogger("uvicorn.error").debug(
+                        "statsig cache write failed: %s",
+                        err,
+                    )
+            return seed_b64, computed_hex
+
+    async def ensure_pair(
+        self,
+        fetch_page: Callable[[], Awaitable[str | None]],
+    ) -> tuple[str, str]:
+        """Ensure a fresh seed pair, fetching the page when stale.
+
+        Concurrent callers share one fetch task per expiry window; a
+        failed fetch falls back to the stale pair or empty strings.
+
+        Args:
+            fetch_page: Async callable returning grok.com index HTML.
+
+        Returns:
+            The active seed and hex pair, or empty strings when none.
+
+        """
+        fresh = self._fresh_pair()
+        if fresh is not None:
+            return fresh
         # Coalesce concurrent fetches: only one fetch per expiry window
         async with self._lock:
-            if self._hex and time.time() - self._fetched_at < 1800:
-                seed_b64 = self._seed_b64
-                hex_ = self._hex
-                if seed_b64 and hex_:
-                    return seed_b64, hex_
+            fresh = self._fresh_pair()
+            if fresh is not None:
+                return fresh
             if self._fetch_task is not None and not self._fetch_task.done():
                 task = self._fetch_task
             else:
-
-                async def _do_fetch(
-                    page: Callable[[], Awaitable[str | None]] = fetch_page,
-                ) -> tuple[str, str] | None:
-                    html: str | None = None
-                    try:
-                        html = await page()
-                    except (
-                        OSError,
-                        RuntimeError,
-                        ValueError,
-                        TypeError,
-                        AttributeError,
-                        TimeoutError,
-                    ) as e:
-                        logging.getLogger("uvicorn.error").debug(
-                            "statsig page fetch failed: %s", e
-                        )
-                        html = None
-                    if not html:
-                        return None
-                    seed_b64 = extract_meta_seed(html)
-                    curves = extract_curves(html)
-                    if not (seed_b64 and curves):
-                        return None
-                    try:
-                        seed = base64.b64decode(seed_b64 + "==")
-                    except (ValueError, TypeError, AttributeError):
-                        return None
-                    if len(curves) == 0 or len(seed) < 48:
-                        return None
-                    idx = seed[5] % len(curves)
-                    try:
-                        path_d = curves_to_path(curves[idx])
-                        computed_hex = compute_animation_hex(path_d, seed)
-                    except (
-                        ValueError,
-                        TypeError,
-                        AttributeError,
-                        IndexError,
-                        KeyError,
-                    ):
-                        return None
-                    async with self._lock:
-                        if self._hex and time.time() - self._fetched_at < 1800:
-                            seed_b64_cached = self._seed_b64
-                            hex_cached = self._hex
-                            if seed_b64_cached and hex_cached:
-                                return seed_b64_cached, hex_cached
-                        self._seed_b64 = seed_b64
-                        self._seed_bytes = seed
-                        self._hex = computed_hex
-                        self._fetched_at = time.time()
-                        if self.store:
-                            try:
-                                self.store.set_statsig(
-                                    seed_b64, computed_hex, self._fetched_at
-                                )
-                            except (
-                                OSError,
-                                RuntimeError,
-                                ValueError,
-                                TypeError,
-                                AttributeError,
-                                sqlite3.Error,
-                            ) as e:
-                                logging.getLogger("uvicorn.error").debug(
-                                    "statsig cache write failed: %s", e
-                                )
-                        return seed_b64, computed_hex
-
-                task = asyncio.create_task(_do_fetch())
+                task = asyncio.create_task(self._do_fetch(fetch_page))
                 self._fetch_task = task
         try:
             result = await task
-        except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as e:
-            logging.getLogger("uvicorn.error").debug("statsig fetch task failed: %s", e)
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ) as err:
+            logging.getLogger("uvicorn.error").debug(
+                "statsig fetch task failed: %s",
+                err,
+            )
             result = None
         # If fetch failed, return stale; if succeeded, task already updated state
         if result is None:
             async with self._lock:
-                seed_b64 = self._seed_b64
-                hex_ = self._hex
-                if seed_b64 and hex_:
-                    return seed_b64, hex_
+                stale_seed = self._seed_b64
+                stale_hex = self._hex
+                if stale_seed and stale_hex:
+                    return stale_seed, stale_hex
                 return "", ""
         return result
 
     def set_pair(self, seed_b64: str, hex_str: str) -> None:
+        """Override the cached pair and persist it to the store.
+
+        Args:
+            seed_b64: Base64 seed string.
+            hex_str: Animation fingerprint hex string.
+
+        """
         self._seed_b64 = seed_b64
         try:
             self._seed_bytes = base64.b64decode(seed_b64 + "==")
@@ -411,14 +636,41 @@ class StatsigGenerator:
 
     @property
     def ready(self) -> bool:
+        """Pair readiness for request signing.
+
+        Returns:
+            True when both seed and hex are cached.
+
+        """
         return bool(self._hex and self._seed_b64)
 
-    def generate(self, pathname: str, method: str, now_unix: int | None = None) -> str:
+    def generate(
+        self,
+        pathname: str,
+        method: str,
+        now_unix: int | None = None,
+    ) -> str:
+        """Generate the x-statsig-id header value for one request.
+
+        Args:
+            pathname: Request path being signed.
+            method: HTTP method being signed.
+            now_unix: Timestamp override, or now when omitted.
+
+        Returns:
+            The base64 header value for this request.
+
+        Raises:
+            RuntimeError: If no pair is cached or the seed is short.
+
+        """
         if not (self._seed_b64 and self._hex):
-            raise RuntimeError("statsig pair unavailable")
+            msg = "statsig pair unavailable"
+            raise RuntimeError(msg)
         seed = self._seed_bytes or base64.b64decode(self._seed_b64 + "==")
-        if len(seed) < 48:
-            raise RuntimeError("statsig seed must be at least 48 bytes")
+        if len(seed) < _MIN_SEED_BYTES:
+            msg = "statsig seed must be at least 48 bytes"
+            raise RuntimeError(msg)
         if now_unix is None:
             now_unix = int(time.time())
         number = (now_unix - STATSIG_EPOCH) & 0xFFFFFFFF

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 grok-to-openai-api contributors.
 """Configuration via environment variables (no secrets hardcoded)."""
 
 import os
@@ -5,14 +6,16 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
+_TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
+
 
 def _load_dotenv() -> None:
     """Tiny .env loader — must run before any os.getenv below."""
     env_path = BASE_DIR / ".env"
     if not env_path.exists():
         return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
@@ -22,14 +25,15 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-HOST = os.getenv("G2O_HOST", "0.0.0.0")
+HOST = os.getenv("G2O_HOST", "127.0.0.1")
 PORT = int(os.getenv("G2O_PORT", "45080"))
 
 ACCOUNTS_FILE = os.getenv("G2O_ACCOUNTS_FILE", str(BASE_DIR / "accounts.txt"))
 # SQLite database path for persistent sessions, accounts and caches
 DB_PATH = os.getenv("G2O_DB_PATH", str(BASE_DIR / "data" / "grok_store.db"))
 
-# Optional API key to protect THIS server (clients must send `Authorization: Bearer <key>`).
+# Optional API key to protect THIS server
+# (clients must send `Authorization: Bearer <key>`).
 API_KEY = os.getenv("G2O_API_KEY", "")
 
 # FreeImage.host API key for hosting generated images (never hardcode; set in .env)
@@ -55,8 +59,8 @@ MAX_SESSIONS = int(os.getenv("G2O_MAX_SESSIONS", "64"))
 
 DEFAULT_MODEL = os.getenv("G2O_DEFAULT_MODEL", "grok-fast")
 # When enabled (1/true/yes/on), append a "Sources" + "Search Queries" appendix
-# to answers that have Grok web search results for llmcord-go's "Show Sources" button.
+# to answers that have Grok web search results for llmcord-go's button.
 _INCLUDE_SOURCES_RAW = os.getenv("G2O_INCLUDE_SOURCES")
 if _INCLUDE_SOURCES_RAW is None:
     _INCLUDE_SOURCES_RAW = os.getenv("GROK_INCLUDE_SOURCES", "0")
-INCLUDE_SOURCES = _INCLUDE_SOURCES_RAW.strip().lower() in ("1", "true", "yes", "on")
+INCLUDE_SOURCES = _INCLUDE_SOURCES_RAW.strip().lower() in _TRUTHY_VALUES
