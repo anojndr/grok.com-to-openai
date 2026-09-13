@@ -310,8 +310,8 @@ class IncludeSourcesFlagTest(unittest.TestCase):
             {"G2O_INCLUDE_SOURCES": "0", "GROK_INCLUDE_SOURCES": "1"},
             clear=False,
         ):
-            importlib.reload(config)
-            if config.INCLUDE_SOURCES:
+            reloaded_config = importlib.reload(config)
+            if reloaded_config.INCLUDE_SOURCES:
                 pytest.fail("G2O_INCLUDE_SOURCES did not take precedence")
 
         # Restore default state
