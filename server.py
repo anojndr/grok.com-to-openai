@@ -148,20 +148,7 @@ def _clone_session_state(state: SessionState, mode: str | None = None) -> Sessio
 
     """
     source = state.grok
-    if isinstance(source, GrokSession):
-        sess = source.clone_checkpoint(mode)
-    else:
-        source_mode = getattr(source, "model_mode", "fast")
-        if not isinstance(source_mode, str):
-            source_mode = "fast"
-        cookie_header = getattr(source, "cookie_header", "")
-        user_id = getattr(source, "user_id", "")
-        sess = GrokSession(cookie_header, user_id, mode or source_mode)
-        sess.conversation_id = getattr(source, "conversation_id", "")
-        sess.last_parent_response_id = getattr(source, "last_parent_response_id", "")
-        sess.attachments = _clean_attachment_registry(
-            getattr(source, "attachments", None),
-        )
+    sess = source.clone_checkpoint(mode)
     return SessionState(
         account_key=state.account_key,
         grok=sess,
@@ -193,14 +180,12 @@ async def fork_session_state(
 
     """
     source = state.grok
-    if isinstance(source, GrokSession):
-        async with source.lock:
-            fork = _clone_session_state(state, mode)
-            fork.grok.ws = source.ws
-            fork.grok.ws_mode = source.ws_mode
-            source.ws = None
-            return fork
-    return _clone_session_state(state, mode)
+    async with source.lock:
+        fork = _clone_session_state(state, mode)
+        fork.grok.ws = source.ws
+        fork.grok.ws_mode = source.ws_mode
+        source.ws = None
+        return fork
 
 
 SESSION_LOCK = asyncio.Lock()
@@ -333,7 +318,7 @@ uid_cache: dict[int, str] = {}
 
 async def _uid_for(acc: Account) -> str:
     user_id = acc.user_id
-    if isinstance(user_id, str) and user_id:
+    if user_id:
         return user_id
     if acc.index not in uid_cache:
         stored_uid = store.get_uid(acc.key)
@@ -430,7 +415,7 @@ def build_history_prompt(
             continue
         c = m.get("content")
         text = c if isinstance(c, str) else content_to_text(c)
-        if isinstance(text, str) and text.strip():
+        if text.strip():
             turns.append((role, text.strip()))
     if turns and turns[-1][0] == "user":
         turns[-1] = ("user", latest_prompt.strip() or turns[-1][1])
@@ -496,8 +481,6 @@ def source_appendix(sources: list[dict[str, Any]], query: str) -> str:
     seen_urls: set[str] = set()
     clean_query = " ".join(query.split()).replace("`", "'").strip() if query else ""
     for src in sources[:SOURCE_APPENDIX_MAX]:
-        if not isinstance(src, dict):
-            continue
         raw_url = src.get("url")
         if not isinstance(raw_url, str) or not raw_url.strip():
             continue
@@ -1520,7 +1503,7 @@ def _remember_caller_ids(
 
     """
     for aid in attachment_ids or []:
-        if isinstance(aid, str) and aid:
+        if aid:
             state.turn_mention(aid)
             if aid not in state.prior_mentioned:
                 state.caller_ids.append(aid)
@@ -2640,7 +2623,7 @@ async def _host_one_image(url: str, cookie: str) -> str | None:
             e,
         )
         return None
-    raw_url = info.get("url") if isinstance(info, dict) else None
+    raw_url = info.get("url")
     if isinstance(raw_url, str) and raw_url:
         return raw_url
     return None
@@ -4052,7 +4035,7 @@ async def _run_continued_response(
     else:
         return acc, result, events, st
     finally:
-        if not turned_ok and forked is not None:
+        if not turned_ok:
             await forked.close()
 
 
@@ -4377,7 +4360,7 @@ async def _stream_continued_response(
         propagate_dropped_attachments(sess_prev.grok, st.grok)
         sse_state.turn_error = e
     finally:
-        if not turned_ok and forked is not None:
+        if not turned_ok:
             await forked.close()
 
 
@@ -4410,10 +4393,6 @@ async def _yield_mock_response_turn(
     turn_acc, mock_turn_res, _mock_events, turn_state = mock_res
     sse_state.turn_acc = turn_acc
     sse_state.turn_state = turn_state
-    if not isinstance(mock_turn_res, TurnResult):
-        msg = "no result from gateway"
-        sse_state.turn_error = GatewayError(UPSTREAM_KIND, msg)
-        return
     sse_state.final_result = mock_turn_res
     filtered_mock = sse_state.render_filter.process(mock_turn_res.text)
     if filtered_mock:

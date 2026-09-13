@@ -15,6 +15,30 @@ fi
 PORT="${G2O_PORT:-45080}"
 BASE_URL="http://localhost:$PORT"
 
+# Locate Python executable: check active virtualenv, local .venv, or PATH
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python3" ]; then
+        PYTHON="$VIRTUAL_ENV/bin/python3"
+    elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+        PYTHON="$VIRTUAL_ENV/bin/python"
+    elif [ -x "$DIR/.venv/bin/python3" ]; then
+        PYTHON="$DIR/.venv/bin/python3"
+    elif [ -x "$DIR/.venv/bin/python" ]; then
+        PYTHON="$DIR/.venv/bin/python"
+    elif command -v python3 &>/dev/null; then
+        PYTHON="$(command -v python3)"
+    elif command -v python &>/dev/null; then
+        PYTHON="$(command -v python)"
+    fi
+fi
+
+if [ -z "${PYTHON:-}" ] || ! "$PYTHON" -c "import uvicorn" &>/dev/null; then
+    echo "✗ Python interpreter (${PYTHON:-none}) does not have uvicorn installed — refusing to restart." >&2
+    echo "  Install dependencies with 'uv sync' or 'pip install -r requirements.txt'." >&2
+    exit 1
+fi
+
 # ── Stop if already running ──────────────────────────────────────────────────
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE")
@@ -66,8 +90,13 @@ fi
  # ── Start ────────────────────────────────────────────────────────────────────
  echo "Starting server on port $PORT..."
  cd "$DIR"
-nohup python3 -m uvicorn server:app --host 0.0.0.0 --port "$PORT" \
-    >> "$LOG_FILE" 2>&1 &
+if command -v setsid &>/dev/null; then
+    setsid nohup "$PYTHON" -m uvicorn server:app --host 0.0.0.0 --port "$PORT" \
+        < /dev/null >> "$LOG_FILE" 2>&1 &
+else
+    nohup "$PYTHON" -m uvicorn server:app --host 0.0.0.0 --port "$PORT" \
+        < /dev/null >> "$LOG_FILE" 2>&1 &
+fi
 START_PID=$!
 echo "$START_PID" > "$PID_FILE"
  
@@ -116,7 +145,17 @@ echo "  Models:    $BASE_URL/v1/models"
 echo "  Health:    $BASE_URL/healthz"
 echo "  Log:       tail -f $LOG_FILE"
 echo "─────────────────────────────────────────────"
-echo ""
-echo "Tailing log (Ctrl+C to stop watching, server keeps running):"
-echo ""
-tail -f "$LOG_FILE"
+
+TAIL_LOG=1
+if [ ! -t 1 ] || [ "${1:-}" = "--no-tail" ] || [ "${1:-}" = "--background" ] || [ "${1:-}" = "-b" ]; then
+    TAIL_LOG=0
+fi
+if [ "${1:-}" = "--tail" ] || [ "${1:-}" = "-f" ]; then
+    TAIL_LOG=1
+fi
+if [ "$TAIL_LOG" -eq 1 ]; then
+    echo ""
+    echo "Tailing log (Ctrl+C to stop watching, server keeps running):"
+    echo ""
+    tail -f "$LOG_FILE"
+fi

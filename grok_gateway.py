@@ -400,8 +400,6 @@ def extract_web_results(event: dict[str, Any]) -> list[dict[str, Any]]:
         Deduplicated citation entries with url and title keys.
 
     """
-    if not isinstance(event, dict):
-        return []
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
     raw_nested = event.get("event")
