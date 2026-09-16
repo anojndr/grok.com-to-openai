@@ -4055,7 +4055,7 @@ async def _persist_response_session(
     if not ctx.users:
         return
     prev_chain = ctx.sess_prev.user_chain if ctx.sess_prev else []
-    full_user_chain = prev_chain + [u for u in ctx.users if u not in prev_chain]
+    full_user_chain = [*prev_chain, *ctx.users]
     st = SessionState(
         account_key=acc.key,
         grok=state.grok,
@@ -4589,7 +4589,7 @@ async def _persist_response_session_for_stream(
     turn_acc = sse_state.turn_acc
     turn_state = sse_state.turn_state
     prev_chain = ctx.sess_prev.user_chain if ctx.sess_prev else []
-    full_user_chain = prev_chain + [u for u in ctx.users if u not in prev_chain]
+    full_user_chain = [*prev_chain, *ctx.users]
     st = SessionState(
         account_key=turn_acc.key,
         grok=turn_state.grok,

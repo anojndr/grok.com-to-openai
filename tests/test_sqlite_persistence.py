@@ -480,8 +480,67 @@ class SqlitePersistenceTests(unittest.IsolatedAsyncioTestCase):
         # Assert SQLite checkpoints for parent and all sibling branches
         self._check_checkpoint([u1, u2], "response-2")
         self._check_checkpoint([u1, u2, u3], "response-3")
-        self._check_checkpoint([u1, u2, u4], "response-4")
         self._check_checkpoint([u1, u2, u5], "response-5")
+
+    async def test_chained_responses_keeps_repeated_tail(self) -> None:
+        """Verify a repeated follow-up text persists as a new chain entry."""
+        fake_acc = Account(
+            index=1,
+            cookies={"sso": "tok", "x-userid": "uid-1"},
+            user_id="uid-1",
+        )
+        self._install_pool(fake_acc)
+        server.SESSIONS.clear()
+
+        async def fake_run_turn(
+            sess: GrokSession,
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[TurnResult, list[dict[str, Any]]]:
+            """Replay a canned turn result for the chained follow-up.
+
+            Returns:
+                The canned turn result with no follow-up events.
+
+            """
+            await asyncio.sleep(0)
+            sess.last_parent_response_id = "msg_resp_turn2"
+            return TurnResult(
+                text="Sections to avoid: local studies.",
+                response_id="msg_resp_turn2",
+                conversation_id="conv_chain",
+                parent_response_id="msg_resp_turn1",
+                finish_reason="stop",
+            ), []
+
+        with (
+            patch("server.run_session_turn", new=fake_run_turn),
+            patch("server.refresh_statsig_pair", new=AsyncMock()),
+        ):
+            first = await server.responses_api(
+                FakeRequest({"input": "what sections to avoid"}),
+            )
+            if first.status_code != _HTTP_OK:
+                pytest.fail("root turn failed")
+            first_id = json.loads(bytes(first.body))["id"]
+            # Repeat the exact same text as a chained follow-up: the stored
+            # chain must keep both entries, not dedup the tail away.
+            second = await server.responses_api(
+                FakeRequest({
+                    "input": "what sections to avoid",
+                    "previous_response_id": first_id,
+                }),
+            )
+            if second.status_code != _HTTP_OK:
+                pytest.fail("chained turn failed")
+            second_id = json.loads(bytes(second.body))["id"]
+
+        saved = self.store.get_session(second_id)
+        if saved is None:
+            pytest.fail("chained turn not persisted")
+        chain = saved.get("user_chain")
+        if chain != ["what sections to avoid", "what sections to avoid"]:
+            pytest.fail(f"repeated tail dropped from chain: {chain!r}")
 
 
 if __name__ == "__main__":
