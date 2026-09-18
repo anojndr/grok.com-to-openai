@@ -15,17 +15,18 @@ fi
 PORT="${G2O_PORT:-45080}"
 BASE_URL="http://localhost:$PORT"
 
-# Locate Python executable: check active virtualenv, local .venv, or PATH
+# Locate Python executable: prefer THIS repo's .venv so an activated
+# VIRTUAL_ENV from a sibling bridge never hijacks the interpreter.
 PYTHON="${PYTHON:-}"
 if [ -z "$PYTHON" ]; then
-    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python3" ]; then
-        PYTHON="$VIRTUAL_ENV/bin/python3"
-    elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
-        PYTHON="$VIRTUAL_ENV/bin/python"
-    elif [ -x "$DIR/.venv/bin/python3" ]; then
+    if [ -x "$DIR/.venv/bin/python3" ]; then
         PYTHON="$DIR/.venv/bin/python3"
     elif [ -x "$DIR/.venv/bin/python" ]; then
         PYTHON="$DIR/.venv/bin/python"
+    elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python3" ]; then
+        PYTHON="$VIRTUAL_ENV/bin/python3"
+    elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+        PYTHON="$VIRTUAL_ENV/bin/python"
     elif command -v python3 &>/dev/null; then
         PYTHON="$(command -v python3)"
     elif command -v python &>/dev/null; then
@@ -43,12 +44,13 @@ fi
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE")
     if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-        # Check command line to avoid killing unrelated processes on PID reuse
+        # Check command line to avoid killing unrelated processes on PID reuse;
+        # scoped to $DIR so a stale pid pointing at a sibling bridge is never killed.
         CMDLINE=""
         if [ -f "/proc/$OLD_PID/cmdline" ]; then
             CMDLINE=$(tr '\0' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null || true)
         fi
-        if [ -z "$CMDLINE" ] || echo "$CMDLINE" | grep -qE "uvicorn|server:app"; then
+        if [ -z "$CMDLINE" ] || echo "$CMDLINE" | grep -qF "$DIR"; then
             echo "Stopping server (pid $OLD_PID)..."
             kill "$OLD_PID" 2>/dev/null || true
             for _ in $(seq 1 20); do
@@ -122,11 +124,12 @@ echo "✓ Server is up: $BASE_URL"
 # $! can be a wrapper subshell (nohup+redirect double-fork), not the uvicorn
 # process itself. Record the pid that actually holds the port so the pid
 # file never points at a dead process while the server runs (or vice versa).
+# Scoped to $DIR so a sibling bridge holding the port pattern never lands in .server.pid.
 if command -v ss &>/dev/null; then
     LISTENER_PID=$(ss -tlnp 2>/dev/null | grep -E "[:.]$PORT([[:space:]]|$)" | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2 || true)
     if [ -n "${LISTENER_PID:-}" ] && kill -0 "$LISTENER_PID" 2>/dev/null; then
         LISTENER_CMD=$(tr '\0' ' ' < "/proc/$LISTENER_PID/cmdline" 2>/dev/null || true)
-        if echo "$LISTENER_CMD" | grep -qE "uvicorn|server:app"; then
+        if echo "$LISTENER_CMD" | grep -qF "$DIR"; then
             echo "$LISTENER_PID" > "$PID_FILE"
         fi
     fi
