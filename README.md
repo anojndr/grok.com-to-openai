@@ -64,8 +64,17 @@ Generated images are automatically uploaded to freeimage.host and returned as
 Markdown links in the assistant response.
 
 ### Load Balancing
-Round-robin across all accounts in `accounts.txt`. Accounts that hit quota limits,
-auth failures, or errors get cooldown periods before being retried. The file is
+Conversations are sticky: each live conversation pins the account that owns
+its gateway conversation (cookies, conversation id, file ids), so follow-up
+turns stay on that account instead of round-robining mid-chat and losing
+history. New conversations still round-robin across `accounts.txt`.
+When the pinned account fails or cools down, the turn migrates to a healthy
+account and rebuilds history plus the newest message from the stored
+transcript (SQLite-backed, so it survives restarts) instead of shipping a
+bare follow-up. `previous_response_id` chains behave the same way: a
+cooled-down pinned account migrates with the transcript; an unknown id is a
+loud 400, never a silent fresh start. Accounts that hit quota limits, auth
+failures, or errors get cooldown periods before being retried. The file is
 hot-reloaded on change (add/remove accounts without restarting).
 ### Degraded Accounts
 Some grok accounts intermittently serve turns where the web-search tool runs

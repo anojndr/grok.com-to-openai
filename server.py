@@ -117,6 +117,7 @@ class SessionState:
         account_key: Owning account key.
         grok: Live gateway session (one per conversation).
         user_chain: Ordered user messages forming the chain key.
+        transcript: Role/content rows backing failover transcript rebuilds.
         created_at: Creation epoch timestamp.
         last_used: Last-use epoch timestamp.
 
@@ -125,6 +126,7 @@ class SessionState:
     account_key: str
     grok: GrokSession
     user_chain: list[str] = field(default_factory=list)
+    transcript: list[dict[str, str]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
@@ -134,6 +136,141 @@ class SessionState:
 
 
 SESSIONS: dict[str, SessionState] = {}
+
+
+def _clean_transcript_rows(entries: object) -> list[dict[str, str]]:
+    """Validate transcript rows to role/content string mappings.
+
+    Args:
+        entries: Raw transcript rows, oldest first.
+
+    Returns:
+        Valid rows with stripped string role and content values.
+
+    """
+    if not isinstance(entries, list):
+        return []
+    out: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        content = entry.get("content")
+        if not isinstance(role, str) or role not in {"user", "assistant", "system"}:
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        out.append({"role": role, "content": content})
+    return out
+
+
+def _append_transcript_turn(
+    rows: list[dict[str, str]],
+    role: str,
+    content: str,
+) -> list[dict[str, str]]:
+    """Append one transcript turn unless the tail already matches.
+
+    The match covers (role, content): a user echo of the previous assistant
+    reply (e.g. "OK") is a new turn, not a duplicate.
+
+    Args:
+        rows: Transcript rows, oldest first.
+        role: Turn role.
+        content: Turn text.
+
+    Returns:
+        Rows with the turn appended unless already the tail.
+
+    """
+    text = content.strip()
+    if text and (
+        not rows or rows[-1].get("role") != role or rows[-1].get("content") != text
+    ):
+        rows = [*rows, {"role": role, "content": text}]
+    return rows
+
+
+def _persisted_transcript(row: Mapping[str, object]) -> list[dict[str, str]]:
+    """Read the transcript rows from a persisted session row.
+
+    Args:
+        row: Raw persisted session mapping.
+
+    Returns:
+        Stored transcript rows, oldest first.
+
+    """
+    return _clean_transcript_rows(row.get("transcript"))
+
+
+def _prior_transcript(
+    prev: list[dict[str, str]],
+    current: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Merge the stored chain transcript with the request transcript.
+
+    The stored checkpoint carries assistant replies (and survives per-client
+    statelessness); the request carries this client's user messages. Merge
+    them by longest-prefix overlap so roles interleave correctly and neither
+    side's history is dropped.
+
+    Args:
+        prev: Stored transcript rows from the previous checkpoint.
+        current: Transcript rows parsed from the current request.
+
+    Returns:
+        Merged rows, oldest first.
+
+    """
+    stored = _clean_transcript_rows(prev)
+    requested = _clean_transcript_rows(current)
+    if not stored:
+        return requested
+    if not requested:
+        return stored
+    best = 0
+    for size in range(1, min(len(stored), len(requested)) + 1):
+        if stored[-size:] == requested[:size]:
+            best = size
+    return [*stored, *requested[best:]]
+
+
+def _advance_fork_transcript(forked: SessionState, prompt: str) -> None:
+    """Append the current user turn to a forked checkpoint transcript.
+
+    The fork carries the checkpoint history forward; recording the newest
+    user message now means the persisted transcript after the turn covers
+    history plus the newest message even when the assistant reply is
+    recorded later by the persist helpers.
+
+    Args:
+        forked: Forked checkpoint advancing the turn.
+        prompt: Current-turn prompt text.
+
+    """
+    rows = _clean_transcript_rows(forked.transcript)
+    forked.transcript = _append_transcript_turn(rows, "user", prompt)
+
+
+def _request_transcript(users: list[str], prompt: str) -> list[dict[str, str]]:
+    """Build transcript rows from the stateless request user chain.
+
+    Early checkpoints persisted before transcript rows existed carry no
+    stored history; the OpenAI-stateless client still resends every user
+    message, so rebuild rows from it (plus the current prompt tail) rather
+    than shipping a bare latest message.
+
+    Args:
+        users: Ordered user messages from the request.
+        prompt: Current-turn prompt text.
+
+    Returns:
+        Transcript rows, oldest first.
+
+    """
+    rows = [{"role": "user", "content": u.strip()} for u in users if u.strip()]
+    return _append_transcript_turn(_clean_transcript_rows(rows), "user", prompt)
 
 
 def _clone_session_state(state: SessionState, mode: str | None = None) -> SessionState:
@@ -153,6 +290,7 @@ def _clone_session_state(state: SessionState, mode: str | None = None) -> Sessio
         account_key=state.account_key,
         grok=sess,
         user_chain=list(state.user_chain),
+        transcript=[dict(row) for row in state.transcript],
         created_at=state.created_at,
         last_used=time.time(),
     )
@@ -284,6 +422,7 @@ async def get_or_create_session(
                 account_key=acc.key,
                 grok=sess,
                 user_chain=_persisted_chain(persisted, users),
+                transcript=_persisted_transcript(persisted),
                 created_at=_persisted_time(persisted, "created_at", time.time()),
                 last_used=time.time(),
             )
@@ -313,23 +452,55 @@ async def get_or_create_session(
     return sess, False
 
 
-uid_cache: dict[int, str] = {}
+uid_cache: dict[str, str] = {}
 
 
 async def _uid_for(acc: Account) -> str:
     user_id = acc.user_id
     if user_id:
         return user_id
-    if acc.index not in uid_cache:
+    if acc.key not in uid_cache:
         stored_uid = store.get_uid(acc.key)
         if stored_uid:
-            uid_cache[acc.index] = stored_uid
+            uid_cache[acc.key] = stored_uid
             acc.user_id = stored_uid
             return stored_uid
-        uid_cache[acc.index] = await gw.resolve_user_id(acc.cookie_header())
-        acc.user_id = uid_cache[acc.index]
+        uid_cache[acc.key] = await gw.resolve_user_id(acc.cookie_header())
+        acc.user_id = uid_cache[acc.key]
         store.set_uid(acc.key, acc.user_id)
-    return uid_cache[acc.index]
+    return uid_cache[acc.key]
+
+
+async def _uid_for_key(account_key: str) -> str:
+    """Resolve the gateway user id for a stored account key.
+
+    Unlike _uid_for, this never touches the pool's usage counters: restore
+    paths call it for accounts that may be cooling down. Resolution failures
+    yield an empty string so restore still builds a migratable checkpoint
+    carrying the stored transcript.
+
+    Args:
+        account_key: Stored account identity key.
+
+    Returns:
+        Gateway user id, or an empty string when unresolvable.
+
+    """
+    acc = next((a for a in pool.snapshot() if a.key == account_key), None)
+    if acc is not None:
+        if acc.user_id:
+            return acc.user_id
+        try:
+            return await _uid_for(acc)
+        except (GatewayError, OSError, RuntimeError, ValueError, TimeoutError) as e:
+            logging.getLogger("uvicorn.error").debug(
+                "uid resolve failed for stored account %s: %s",
+                account_key,
+                e,
+            )
+            return ""
+    stored_uid = store.get_uid(account_key)
+    return stored_uid or ""
 
 
 def user_texts(messages: list[dict[str, Any]]) -> list[str]:
@@ -640,6 +811,28 @@ def content_to_text(content: object) -> str:
                 if isinstance(text, str):
                     parts.append(text)
     return "\n".join(parts)
+
+
+def _flat_transcript(flat: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Project flattened messages to stored transcript rows.
+
+    Args:
+        flat: Flattened chat messages with text content.
+
+    Returns:
+        Role/content rows for user and assistant messages.
+
+    """
+    rows: list[dict[str, str]] = []
+    for m in flat:
+        role = m.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = m.get("content")
+        text = content if isinstance(content, str) else content_to_text(content)
+        if text.strip():
+            rows.append({"role": role, "content": text.strip()})
+    return rows
 
 
 _TEXT_PART_TYPES = frozenset({"text", "input_text"})
@@ -1154,6 +1347,37 @@ def _session_attachments(sess: GrokSession) -> list[dict[str, Any]]:
 
     """
     return _clean_attachment_registry(getattr(sess, "attachments", None))
+
+
+def _session_transcript(
+    base: list[dict[str, str]],
+    prompt: str,
+    sess: GrokSession,
+    assistant_text: str = "",
+) -> list[dict[str, str]]:
+    """Finalize the stored transcript for a completed turn.
+
+    The request transcript carries the client-visible turns; the completed
+    turn's user prompt and assistant reply are appended so a later failover
+    rebuild carries history plus the newest message. Turns are deduplicated
+    by (role, content) tail match so replays of the same transcript do not
+    duplicate rows. The assistant row is recorded only from actual reply
+    text: gateway response ids are opaque tokens, never message content, so
+    they must not render as "Assistant: <id>" in a failover rebuild.
+
+    Args:
+        base: Request transcript rows, oldest first.
+        prompt: Current-turn prompt text.
+        sess: Gateway session carrying the completed turn state.
+        assistant_text: Assistant reply text for the completed turn.
+
+    Returns:
+        Transcript rows with the current turn and reply appended.
+
+    """
+    _ = sess
+    rows = _append_transcript_turn(_clean_transcript_rows(base), "user", prompt)
+    return _append_transcript_turn(rows, "assistant", assistant_text)
 
 
 def propagate_dropped_attachments(
@@ -1741,6 +1965,60 @@ class _TurnPrompts:
     file_jobs: list[dict[str, Any]] | None
     system_prompt: str | None
 
+    def with_fresh(self, fresh: str) -> _TurnPrompts:
+        """Return a copy carrying a checkpoint-rendered fresh prompt.
+
+        Args:
+            fresh: Fresh-session prompt rebuilt from the checkpoint.
+
+        Returns:
+            Prompt bundle with the fresh field replaced.
+
+        """
+        return _TurnPrompts(
+            mode=self.mode,
+            continuation=self.continuation,
+            fresh=fresh,
+            latest=self.latest,
+            attachment_ids=self.attachment_ids,
+            file_jobs=self.file_jobs,
+            system_prompt=self.system_prompt,
+        )
+
+
+def _render_transcript_prompt(transcript: list[dict[str, str]]) -> str | None:
+    """Render stored transcript rows as a role-labeled failover prompt.
+
+    Args:
+        transcript: Stored role/content rows, oldest first.
+
+    Returns:
+        Transcript prompt, or None when fewer than two turns exist.
+
+    """
+    rows = _clean_transcript_rows(transcript)
+    if len(rows) <= 1:
+        return None
+    return "\n\n".join(
+        f"{'User' if row['role'] == 'user' else 'Assistant'}: {row['content']}"
+        for row in rows
+    )
+
+
+def render_transcript_prompt_for_tests(
+    transcript: list[dict[str, str]],
+) -> str | None:
+    """Render transcript rows for tests.
+
+    Args:
+        transcript: Stored role/content rows, oldest first.
+
+    Returns:
+        Transcript prompt, or None when fewer than two turns exist.
+
+    """
+    return _render_transcript_prompt(transcript)
+
 
 def _resolve_turn_prompts(kwargs: PickOptions) -> _TurnPrompts:
     """Split turn options into failover prompts and threading options.
@@ -1777,6 +2055,39 @@ def _resolve_turn_prompts(kwargs: PickOptions) -> _TurnPrompts:
     )
 
 
+def _prompts_for_checkpoint(
+    prompts: _TurnPrompts,
+    state: SessionState,
+    prompt: str,
+) -> _TurnPrompts:
+    """Rebuild the fresh prompt from the checkpoint's stored transcript.
+
+    A stored transcript outranks the request-built transcript: the request
+    only carries this client's messages, while the checkpoint also carries
+    assistant replies (and survives per-client statelessness). The current
+    turn is appended when the transcript does not already end with it, so a
+    migrated turn resends history plus the newest message.
+
+    Args:
+        prompts: Base prompt bundle for the turn.
+        state: Checkpoint backing the turn.
+        prompt: Current-turn prompt (already includes inlined text files).
+
+    Returns:
+        Prompt bundle with the fresh field rebuilt when possible.
+
+    """
+    rows = _append_transcript_turn(
+        _clean_transcript_rows(state.transcript),
+        "user",
+        prompt,
+    )
+    rendered = _render_transcript_prompt(rows)
+    if rendered is None:
+        return prompts
+    return prompts.with_fresh(rendered)
+
+
 async def _restore_checkpoint_state(
     session_key: str,
     users: list[str],
@@ -1785,7 +2096,10 @@ async def _restore_checkpoint_state(
     """Restore a checkpoint from memory or SQLite.
 
     Memory is checked first without blocking on I/O; SQLite restore runs
-    outside the lock to avoid stalling other requests on disk.
+    outside the lock to avoid stalling other requests on disk. A checkpoint
+    whose pinned account is cooling still returns its stored transcript via
+    a detached state (no live socket), so failover can rebuild history plus
+    the newest message on a healthy account instead of a bare prompt.
 
     Args:
         session_key: Chain key of the checkpoint.
@@ -1793,7 +2107,8 @@ async def _restore_checkpoint_state(
         mode: Model mode for a rebuilt session.
 
     Returns:
-        Restored checkpoint, or None when absent or account-unavailable.
+        Restored checkpoint, a detached transcript-only state when the
+        pinned account is unavailable, or None when absent.
 
     """
     async with SESSION_LOCK:
@@ -1803,12 +2118,24 @@ async def _restore_checkpoint_state(
     persisted = store.get_session(session_key)
     if not persisted:
         return None
+    account_key = persisted.get("account_key")
     acc_cand = next(
-        (a for a in pool.snapshot() if a.key == persisted["account_key"]),
+        (a for a in pool.snapshot() if a.key == account_key),
         None,
     )
     if acc_cand is None or not acc_cand.available():
-        return None
+        if not isinstance(account_key, str) or not account_key:
+            return None
+        detached = GrokSession("", "", mode)
+        detached.attachments = _clean_attachment_registry(persisted.get("attachments"))
+        return SessionState(
+            account_key=account_key,
+            grok=detached,
+            user_chain=_persisted_chain(persisted, users),
+            transcript=_persisted_transcript(persisted),
+            created_at=_persisted_time(persisted, "created_at", time.time()),
+            last_used=time.time(),
+        )
     uid = await _uid_for(acc_cand)
     sess = GrokSession(acc_cand.cookie_header(), uid, mode)
     sess.conversation_id = _persisted_str(persisted, "conversation_id", "")
@@ -1822,6 +2149,7 @@ async def _restore_checkpoint_state(
         account_key=acc_cand.key,
         grok=sess,
         user_chain=_persisted_chain(persisted, users),
+        transcript=_persisted_transcript(persisted),
         created_at=_persisted_time(persisted, "created_at", time.time()),
         last_used=time.time(),
     )
@@ -1943,15 +2271,19 @@ async def _stream_checkpoint_turn(
 
     """
     if not (state.grok.alive() or state.grok.conversation_id):
+        if state.account_key and state.account_key not in tried:
+            tried.add(state.account_key)
         return
     acc = pool.acquire_by_key(state.account_key)
     if acc is None or acc.key in tried:
+        if state.account_key and state.account_key not in tried:
+            tried.add(state.account_key)
         return
     tried.add(acc.key)
-    outcome.attempted = True
     source_state = state
     forked = await fork_session_state(source_state, prompts.mode)
     forked.touch()
+    _advance_fork_transcript(forked, prompts.continuation)
     store.touch_session(session_key, forked.last_used)
     yielded_any = False
     try:
@@ -2030,6 +2362,31 @@ async def _stream_fresh_turn(
         outcome.error = e
 
 
+async def _checkpoint_attempt_prompts(
+    session_key: str,
+    users: list[str],
+    prompts: _TurnPrompts,
+    tried: set[str],
+) -> _TurnPrompts | None:
+    """Preview the fresh fallback a detached checkpoint would rebuild.
+
+    Args:
+        session_key: Chain key of the checkpoint to continue.
+        users: Ordered user messages for fallback chain data.
+        prompts: Resolved continuation prompts and threading options.
+        tried: Account keys already attempted.
+
+    Returns:
+        Rebuilt attempt prompts when the checkpoint is detached, else None.
+
+    """
+    _ = tried
+    st = await _restore_checkpoint_state(session_key, users, prompts.mode)
+    if st is None or (st.grok.alive() or st.grok.conversation_id):
+        return None
+    return _attempt_prompts(prompts, st, users)
+
+
 async def _stream_checkpoint_attempt(
     session_key: str,
     users: list[str],
@@ -2053,7 +2410,14 @@ async def _stream_checkpoint_attempt(
     st = await _restore_checkpoint_state(session_key, users, prompts.mode)
     if st is None:
         return
-    async for ev in _stream_checkpoint_turn(session_key, st, prompts, tried, outcome):
+    checkpoint_prompts = _attempt_prompts(prompts, st, users)
+    async for ev in _stream_checkpoint_turn(
+        session_key,
+        st,
+        checkpoint_prompts,
+        tried,
+        outcome,
+    ):
         yield ev
 
 
@@ -2116,10 +2480,19 @@ async def pick_account_and_stream_turn(
     prompts = _resolve_turn_prompts(kwargs)
     tried: set[str] = set()
     last_err: GatewayError | None = None
+    detached_fallback: _TurnPrompts | None = None
     while True:
         await pool.reload_if_changed()
         outcome = _StreamAttempt()
         if session_key:
+            checkpoint_prompts = await _checkpoint_attempt_prompts(
+                session_key,
+                users,
+                prompts,
+                tried,
+            )
+            if checkpoint_prompts is not None:
+                detached_fallback = checkpoint_prompts
             async for ev in _stream_checkpoint_attempt(
                 session_key,
                 users,
@@ -2133,7 +2506,15 @@ async def pick_account_and_stream_turn(
             if outcome.error is not None:
                 last_err = outcome.error
                 continue
-        async for ev in _stream_fresh_attempt(users, prompts, tried, last_err, outcome):
+        fresh_prompts = detached_fallback or prompts
+        detached_fallback = None
+        async for ev in _stream_fresh_attempt(
+            users,
+            fresh_prompts,
+            tried,
+            last_err,
+            outcome,
+        ):
             yield ev
         if outcome.done:
             return
@@ -2720,6 +3101,27 @@ async def _run_fresh_buffered_turn(
     outcome.turn = (acc, result, events, state)
 
 
+async def _advance_checkpoint_fork(
+    session_key: str,
+    state: SessionState,
+    prompts: _TurnPrompts,
+) -> SessionState:
+    """Fork a checkpoint and record the newest user turn on the fork.
+
+    Args:
+        session_key: Chain key for session touching.
+        state: Checkpoint to fork and advance.
+        prompts: Resolved continuation prompts and threading options.
+
+    Returns:
+        Touched fork carrying the live socket when present.
+
+    """
+    fork_state = await _fork_turn_state(session_key, state, prompts.mode)
+    _advance_fork_transcript(fork_state, prompts.continuation)
+    return fork_state
+
+
 async def _run_checkpoint_turn(
     session_key: str,
     state: SessionState,
@@ -2738,9 +3140,13 @@ async def _run_checkpoint_turn(
 
     """
     if not (state.grok.alive() or state.grok.conversation_id):
+        if state.account_key and state.account_key not in tried:
+            tried.add(state.account_key)
         return
     acc = pool.acquire_by_key(state.account_key)
     if acc is None or acc.key in tried:
+        if state.account_key and state.account_key not in tried:
+            tried.add(state.account_key)
         return
     tried.add(acc.key)
     outcome.attempted = True
@@ -2749,7 +3155,7 @@ async def _run_checkpoint_turn(
     fork_state = state
     try:
         source_state = state
-        fork_state = await _fork_turn_state(session_key, state, prompts.mode)
+        fork_state = await _advance_checkpoint_fork(session_key, state, prompts)
         forked = fork_state.grok
         await _run_forked_turn(acc, fork_state, source_state, prompts, outcome)
         turned_ok = True
@@ -2799,6 +3205,71 @@ async def _run_fresh_turn(
         outcome.error = e
 
 
+def _attempt_prompts(
+    prompts: _TurnPrompts,
+    st: SessionState,
+    users: list[str],
+) -> _TurnPrompts:
+    """Resolve attempt prompts with checkpoint and request fallbacks.
+
+    Args:
+        prompts: Base prompt bundle for the turn.
+        st: Checkpoint backing the turn.
+        users: Ordered user messages from the request.
+
+    Returns:
+        Prompt bundle with the fresh field rebuilt when possible.
+
+    """
+    attempt_prompts = _prompts_for_checkpoint(prompts, st, prompts.continuation)
+    has_stored = bool(_clean_transcript_rows(st.transcript))
+    if attempt_prompts.fresh == prompts.fresh and not has_stored:
+        rendered = _render_transcript_prompt(
+            _request_transcript(users, prompts.continuation),
+        )
+        if rendered is not None:
+            attempt_prompts = prompts.with_fresh(rendered)
+    return attempt_prompts
+
+
+async def _run_pick_checkpoint_turn(
+    session_key: str,
+    users: list[str],
+    prompts: _TurnPrompts,
+    tried: set[str],
+    detached_fallback: _TurnPrompts | None,
+) -> tuple[
+    _BufferedAttempt | None,
+    _TurnPrompts | None,
+    tuple[Account, TurnResult, list[dict[str, Any]], SessionState] | None,
+]:
+    """Run one checkpoint leg of the buffered pick failover walk.
+
+    Args:
+        session_key: Chain key of the checkpoint to continue.
+        users: Ordered user messages for fresh sessions.
+        prompts: Resolved prompt bundle for the turn.
+        tried: Account keys already attempted (mutated).
+        detached_fallback: Current detached fresh fallback.
+
+    Returns:
+        Tuple of the attempt outcome (None when skipped), the updated
+        detached fallback, and the completed turn (None when not done).
+
+    """
+    st = await _restore_checkpoint_state(session_key, users, prompts.mode)
+    if st is None:
+        return None, detached_fallback, None
+    outcome = _BufferedAttempt()
+    attempt_prompts = _attempt_prompts(prompts, st, users)
+    if not (st.grok.alive() or st.grok.conversation_id):
+        detached_fallback = attempt_prompts
+    await _run_checkpoint_turn(session_key, st, attempt_prompts, tried, outcome)
+    if outcome.turn is not None:
+        return outcome, detached_fallback, outcome.turn
+    return outcome, detached_fallback, None
+
+
 async def pick_account_and_turn(
     session_key: str | None,
     users: list[str],
@@ -2826,17 +3297,21 @@ async def pick_account_and_turn(
     prompts = _resolve_turn_prompts(kwargs)
     tried: set[str] = set()
     last_err: GatewayError | None = None
+    detached_fallback: _TurnPrompts | None = None
     while True:
         await pool.reload_if_changed()
         if session_key:
-            st = await _restore_checkpoint_state(session_key, users, prompts.mode)
-            if st is not None:
-                outcome = _BufferedAttempt()
-                await _run_checkpoint_turn(session_key, st, prompts, tried, outcome)
-                if outcome.turn is not None:
-                    return outcome.turn
-                if outcome.error is not None:
-                    last_err = outcome.error
+            outcome, detached_fallback, done = await _run_pick_checkpoint_turn(
+                session_key,
+                users,
+                prompts,
+                tried,
+                detached_fallback,
+            )
+            if done is not None:
+                return done
+            if outcome is not None and outcome.error is not None:
+                last_err = outcome.error
         acc = pool.acquire(exclude=tried, include_degraded=True)
         if acc is None:
             if last_err is not None:
@@ -2845,7 +3320,9 @@ async def pick_account_and_turn(
             raise HTTPException(503, "no accounts available")
         tried.add(acc.key)
         outcome = _BufferedAttempt()
-        await _run_fresh_turn(users, prompts, acc, outcome)
+        fresh_prompts = detached_fallback or prompts
+        detached_fallback = None
+        await _run_fresh_turn(users, fresh_prompts, acc, outcome)
         if outcome.turn is not None:
             return outcome.turn
         if outcome.error is not None:
@@ -2894,6 +3371,7 @@ class _ChatContext:
     req_include_sources: bool
     history_prompt: str
     flat: list[dict[str, Any]]
+    transcript: list[dict[str, str]]
     rid: str
     created: int
 
@@ -3025,16 +3503,14 @@ async def _build_chat_context(
     messages = _chat_messages(body)
     flat, file_jobs = await extract_attachments(messages)
     mode, public_model = resolve_mode(model_in)
-    system_prompt, convo_msgs = _split_system_messages(flat)
-    auth_header = request.headers.get("authorization", "")
-    users = user_texts(convo_msgs)
-    prefix_key = (
-        chain_key(users[:-1], auth_header)
-        if len(users) >= MIN_USERS_FOR_CHAIN_KEY
-        else None
+    system_prompt, users, auth_header, prefix_key = _chat_identity(
+        request,
+        flat,
+        mode,
     )
     prompt = users[-1] if users else ""
     prompt, remaining_jobs = _inline_text_attachments(prompt, file_jobs)
+    transcript = _flat_transcript(flat)
     return _ChatContext(
         stream=stream,
         include_usage=include_usage,
@@ -3049,9 +3525,38 @@ async def _build_chat_context(
         req_include_sources=include_sources(body.get("include_sources")),
         history_prompt=build_history_prompt(flat, prompt),
         flat=flat,
+        transcript=transcript,
         rid="chatcmpl-" + uuid.uuid4().hex[:24],
         created=now_epoch(),
     )
+
+
+def _chat_identity(
+    request: Request,
+    flat: list[dict[str, Any]],
+    mode: str,
+) -> tuple[str | None, list[str], str, str | None]:
+    """Resolve system prompt, user chain, auth, and chain key.
+
+    Args:
+        request: Incoming FastAPI request.
+        flat: Flattened chat messages with text content.
+        mode: Resolved gateway mode (unused, kept for call symmetry).
+
+    Returns:
+        Tuple of system prompt, user chain, auth header, and prefix key.
+
+    """
+    _ = mode
+    system_prompt, convo_msgs = _split_system_messages(flat)
+    auth_header = request.headers.get("authorization", "")
+    users = user_texts(convo_msgs)
+    prefix_key = (
+        chain_key(users[:-1], auth_header)
+        if len(users) >= MIN_USERS_FOR_CHAIN_KEY
+        else None
+    )
+    return system_prompt, users, auth_header, prefix_key
 
 
 def _turn_kwargs(ctx: _ChatContext) -> PickOptions:
@@ -3311,7 +3816,7 @@ async def _serve_chat_completion(ctx: _ChatContext) -> JSONResponse:
         system_prompt=ctx.system_prompt,
     )
     if ctx.users:
-        await _persist_chat_session(ctx, acc, state)
+        await _persist_chat_session(ctx, acc, state, result.text)
     image_urls = list(result.image_urls)
     if image_urls:
         hosted = await host_images(image_urls, acc.cookie_header())
@@ -3356,6 +3861,7 @@ async def _persist_chat_session(
     ctx: _ChatContext,
     acc: Account,
     state: SessionState,
+    assistant_text: str = "",
 ) -> None:
     """Persist the session so the next incremental call reuses it.
 
@@ -3363,12 +3869,16 @@ async def _persist_chat_session(
         ctx: Populated chat context.
         acc: Account owning the session.
         state: Live turn state to persist.
+        assistant_text: Assistant reply text for the completed turn.
 
     """
+    base = _prior_transcript(state.transcript, ctx.transcript)
+    transcript = _session_transcript(base, ctx.prompt, state.grok, assistant_text)
     st = SessionState(
         account_key=acc.key,
         grok=state.grok,
         user_chain=list(ctx.users),
+        transcript=transcript,
     )
     async with SESSION_LOCK:
         SESSIONS[chain_key(ctx.users, ctx.auth_header)] = st
@@ -3381,6 +3891,7 @@ async def _persist_chat_session(
         last_parent_response_id=state.grok.last_parent_response_id,
         model_mode=ctx.mode,
         attachments=_session_attachments(state.grok),
+        transcript=transcript,
         created_at=st.created_at,
         last_used=st.last_used,
     )
@@ -3606,10 +4117,14 @@ async def _persist_chat_stream_session(
         return
     turn_acc = sse_state.turn_acc
     turn_state = sse_state.turn_state
+    streamed_text = "".join(sse_state.accumulated)
+    base = _prior_transcript(turn_state.transcript, ctx.transcript)
+    transcript = _session_transcript(base, ctx.prompt, turn_state.grok, streamed_text)
     st = SessionState(
         account_key=turn_acc.key,
         grok=turn_state.grok,
         user_chain=list(ctx.users),
+        transcript=transcript,
     )
     async with SESSION_LOCK:
         SESSIONS[chain_key(ctx.users, ctx.auth_header)] = st
@@ -3813,6 +4328,11 @@ def _responses_messages(
 async def _restore_prev_session(prev_resp_id: str) -> SessionState | None:
     """Restore a previous-response session from memory or SQLite.
 
+    The restore is side-effect free: restoring must never hand out the pinned
+    account (acquire_by_key only increments usage counters), so a cooled-down
+    pinned account stays visible as a stored checkpoint and the continued
+    turn can migrate to a healthy account with the stored transcript.
+
     Args:
         prev_resp_id: Previous response id key.
 
@@ -3830,12 +4350,9 @@ async def _restore_prev_session(prev_resp_id: str) -> SessionState | None:
     account_key = persisted.get("account_key")
     if not isinstance(account_key, str):
         return None
-    acc_cand = pool.acquire_by_key(account_key)
-    if not acc_cand:
-        return None
-    uid = await _uid_for(acc_cand)
+    uid = await _uid_for_key(account_key)
     sess = GrokSession(
-        acc_cand.cookie_header(),
+        _cookie_for_key(account_key),
         uid,
         _persisted_str(persisted, "model_mode", "fast"),
     )
@@ -3847,9 +4364,10 @@ async def _restore_prev_session(prev_resp_id: str) -> SessionState | None:
     )
     sess.attachments = _clean_attachment_registry(persisted.get("attachments"))
     sess_new = SessionState(
-        account_key=acc_cand.key,
+        account_key=account_key,
         grok=sess,
         user_chain=_persisted_chain(persisted, []),
+        transcript=_persisted_transcript(persisted),
         created_at=_persisted_time(persisted, "created_at", time.time()),
         last_used=time.time(),
     )
@@ -3858,6 +4376,35 @@ async def _restore_prev_session(prev_resp_id: str) -> SessionState | None:
             SESSIONS[prev_resp_id] = sess_new
             return sess_new
         return SESSIONS[prev_resp_id]
+
+
+async def restore_prev_session_for_tests(
+    prev_resp_id: str,
+) -> SessionState | None:
+    """Restore a previous-response session for tests.
+
+    Args:
+        prev_resp_id: Previous response id key.
+
+    Returns:
+        Restored session state, if available.
+
+    """
+    return await _restore_prev_session(prev_resp_id)
+
+
+def _cookie_for_key(account_key: str) -> str:
+    """Read the current cookie header for a stored account key.
+
+    Args:
+        account_key: Stored account identity key.
+
+    Returns:
+        Cookie header, or an empty string when the account left the pool.
+
+    """
+    acc = next((a for a in pool.snapshot() if a.key == account_key), None)
+    return acc.cookie_header() if acc else ""
 
 
 def _latest_user_prompt(flat: list[dict[str, Any]]) -> str:
@@ -3894,6 +4441,7 @@ class _ResponsesContext:
     remaining_jobs: list[dict[str, Any]]
     req_include_sources: bool
     history_prompt: str
+    transcript: list[dict[str, str]]
     rid: str
     msg_id: str
     created: int
@@ -3926,13 +4474,15 @@ async def _build_responses_context(
     auth_header = request.headers.get("authorization", "")
     sess_prev: SessionState | None = None
     if prev_resp_id:
+        if not isinstance(prev_resp_id, str) or not prev_resp_id.strip():
+            raise HTTPException(400, "previous_response_id must be a string")
         sess_prev = await _restore_prev_session(prev_resp_id)
+        if sess_prev is None:
+            raise HTTPException(
+                400,
+                f"unknown previous_response_id: {prev_resp_id}",
+            )
         if not messages:
-            if not sess_prev:
-                raise HTTPException(
-                    400,
-                    f"unknown previous_response_id: {prev_resp_id}",
-                )
             raise HTTPException(400, "input required with previous_response_id")
     if not messages:
         raise HTTPException(400, "input required")
@@ -3962,6 +4512,7 @@ async def _build_responses_context(
         remaining_jobs=remaining_jobs,
         req_include_sources=include_sources(body.get("include_sources")),
         history_prompt=build_history_prompt(flat, prompt),
+        transcript=_flat_transcript(flat),
         rid="resp_" + uuid.uuid4().hex,
         msg_id="msg_" + uuid.uuid4().hex,
         created=now_epoch(),
@@ -3994,6 +4545,12 @@ async def _run_continued_response(
 ) -> tuple[Account, TurnResult, list[dict[str, Any]], SessionState]:
     """Run a buffered turn continuing the previous response's session.
 
+    The previous response pins its account (sticky): the gateway conversation
+    and its file ids only exist on that account, so cross-account mentions
+    fail. When the pinned account cools down, the turn migrates to a healthy
+    account and rebuilds history plus the newest message from the stored
+    transcript, so the client keeps history instead of a 409.
+
     Args:
         ctx: Populated responses context.
         sess_prev: Previous response's session state to fork.
@@ -4002,47 +4559,93 @@ async def _run_continued_response(
         Tuple of account, turn result, events, and live state.
 
     Raises:
-        HTTPException: If the previous account cools down or the turn fails.
+        HTTPException: If no account can serve the turn or it fails.
 
     """
     acc = pool.acquire_by_key(sess_prev.account_key)
-    if not acc:
-        raise HTTPException(
-            409,
-            "previous response account is cooling down; retry",
-        )
-    turned_ok = False
-    forked: GrokSession | None = None
-    st = await fork_session_state(sess_prev, ctx.mode)
-    forked = st.grok
-    st.touch()
-    try:
-        result, events = await run_session_turn(
-            st.grok,
-            ctx.prompt,
-            file_jobs=ctx.remaining_jobs or None,
-            system_prompt=ctx.instructions,
-        )
-        propagate_dropped_attachments(sess_prev.grok, st.grok)
-        pool.release_ok(acc)
-        turned_ok = True
-    except GatewayError as e:
-        pool.release_fail(acc, _fail_kind(e))
-        await st.grok.close()
-        propagate_dropped_attachments(sess_prev.grok, st.grok)
-        status = _gateway_http_status(e)
-        raise HTTPException(status, f"grok error ({e.kind}): {e}") from e
-    else:
-        return acc, result, events, st
-    finally:
-        if not turned_ok:
-            await forked.close()
+    if acc is not None:
+        turned_ok = False
+        forked: GrokSession | None = None
+        st = await fork_session_state(sess_prev, ctx.mode)
+        forked = st.grok
+        st.touch()
+        try:
+            result, events = await run_session_turn(
+                st.grok,
+                ctx.prompt,
+                file_jobs=ctx.remaining_jobs or None,
+                system_prompt=ctx.instructions,
+            )
+            propagate_dropped_attachments(sess_prev.grok, st.grok)
+            pool.release_ok(acc)
+            turned_ok = True
+        except GatewayError as e:
+            pool.release_fail(acc, _fail_kind(e))
+            await st.grok.close()
+            propagate_dropped_attachments(sess_prev.grok, st.grok)
+            status = _gateway_http_status(e)
+            raise HTTPException(status, f"grok error ({e.kind}): {e}") from e
+        else:
+            return acc, result, events, st
+        finally:
+            if not turned_ok:
+                await forked.close()
+        msg = "continued turn failed without a gateway error"
+        raise HTTPException(502, msg)
+    return await _run_migrated_response(ctx, sess_prev)
+
+
+def _migrated_history_prompt(
+    sess_prev: SessionState,
+    ctx: _ResponsesContext,
+) -> str:
+    """Build the history prompt for a migrated chained turn.
+
+    Args:
+        sess_prev: Previous response's session state to migrate.
+        ctx: Populated responses context.
+
+    Returns:
+        Stored-plus-request transcript prompt, or the request fallback.
+
+    """
+    base = _prior_transcript(sess_prev.transcript, ctx.transcript)
+    rows = _append_transcript_turn(list(base), "user", ctx.prompt)
+    return _render_transcript_prompt(rows) or ctx.history_prompt
+
+
+async def _run_migrated_response(
+    ctx: _ResponsesContext,
+    sess_prev: SessionState,
+) -> tuple[Account, TurnResult, list[dict[str, Any]], SessionState]:
+    """Run a chained turn migrated off a cooled-down pinned account.
+
+    Args:
+        ctx: Populated responses context.
+        sess_prev: Previous response's session state to migrate.
+
+    Returns:
+        Tuple of account, turn result, events, and live state.
+
+    """
+    history_prompt = _migrated_history_prompt(sess_prev, ctx)
+    return await pick_account_and_turn(
+        ctx.prefix_key,
+        [*sess_prev.user_chain, *ctx.users],
+        mode=ctx.mode,
+        prompt=ctx.prompt,
+        history_prompt=history_prompt,
+        latest=ctx.prompt,
+        file_jobs=ctx.remaining_jobs or None,
+        system_prompt=ctx.instructions,
+    )
 
 
 async def _persist_response_session(
     ctx: _ResponsesContext,
     acc: Account,
     state: SessionState,
+    assistant_text: str = "",
 ) -> None:
     """Persist response sessions under response, chain, and user keys.
 
@@ -4050,25 +4653,31 @@ async def _persist_response_session(
         ctx: Populated responses context.
         acc: Account owning the session.
         state: Live turn state to persist.
+        assistant_text: Assistant reply text for the completed turn.
 
     """
     if not ctx.users:
         return
     prev_chain = ctx.sess_prev.user_chain if ctx.sess_prev else []
     full_user_chain = [*prev_chain, *ctx.users]
+    prev_transcript = ctx.sess_prev.transcript if ctx.sess_prev else []
+    base = _prior_transcript(prev_transcript, ctx.transcript)
+    transcript = _session_transcript(base, ctx.prompt, state.grok, assistant_text)
     st = SessionState(
         account_key=acc.key,
         grok=state.grok,
         user_chain=full_user_chain,
+        transcript=transcript,
     )
+    curr_key = chain_key(full_user_chain, ctx.auth_header)
     async with SESSION_LOCK:
         SESSIONS[ctx.rid] = st  # previous_response_id -> session
         SESSIONS[ctx.rid + ":chain"] = st
-        SESSIONS[chain_key(ctx.users, ctx.auth_header)] = st
+        SESSIONS[curr_key] = st
     for session_key in (
         ctx.rid,
         ctx.rid + ":chain",
-        chain_key(ctx.users, ctx.auth_header),
+        curr_key,
     ):
         store.save_session(
             session_key=session_key,
@@ -4078,6 +4687,7 @@ async def _persist_response_session(
             last_parent_response_id=state.grok.last_parent_response_id,
             model_mode=ctx.mode,
             attachments=_session_attachments(state.grok),
+            transcript=transcript,
             created_at=st.created_at,
             last_used=st.last_used,
         )
@@ -4114,7 +4724,7 @@ async def _serve_response(ctx: _ResponsesContext) -> JSONResponse:
         hosted = await host_images(image_urls, acc.cookie_header())
         md = "\n\n".join(f"![generated image]({u})" for u in hosted)
         result.text = (result.text + "\n\n" + md).strip()
-    await _persist_response_session(ctx, acc, state)
+    await _persist_response_session(ctx, acc, state, result.text)
     appendix = _sources_appendix_text(
         result.sources,
         result.search_queries,
@@ -4306,6 +4916,44 @@ def _render_response_delta(
             sse_state.final_result = sess_done
 
 
+async def _stream_migrated_response(
+    ctx: _ResponsesContext,
+    sess_prev: SessionState,
+    sse_state: _ResponsesStreamState,
+    writer: _ResponseEventWriter,
+) -> AsyncIterator[str]:
+    """Stream a chained turn migrated off a cooled-down pinned account.
+
+    Args:
+        ctx: Populated responses context.
+        sess_prev: Previous response's session state to migrate.
+        sse_state: Mutable stream accumulation state.
+        writer: Numbering event writer.
+
+    Yields:
+        SSE event frames.
+
+    """
+    history_prompt = _migrated_history_prompt(sess_prev, ctx)
+    try:
+        async for ev in pick_account_and_stream_turn(
+            ctx.prefix_key,
+            [*sess_prev.user_chain, *ctx.users],
+            mode=ctx.mode,
+            prompt=ctx.prompt,
+            history_prompt=history_prompt,
+            latest=ctx.prompt,
+            file_jobs=ctx.remaining_jobs or None,
+            system_prompt=ctx.instructions,
+        ):
+            sse_state.turn_acc = ev.get("acc")
+            sse_state.turn_state = ev.get("state")
+            for frame in _render_response_delta(ctx, sse_state, writer, ev):
+                yield frame
+    except (GatewayError, HTTPException) as e:
+        sse_state.turn_error = e
+
+
 async def _stream_continued_response(
     ctx: _ResponsesContext,
     sess_prev: SessionState,
@@ -4316,7 +4964,9 @@ async def _stream_continued_response(
 
     Turn failure after the initial frames are flushed terminates the SSE
     stream with a structured response.failed event; raising HTTPException
-    here would abort the connection mid-stream instead.
+    here would abort the connection mid-stream instead. When the pinned
+    account cools down, the turn migrates to a healthy account through the
+    shared pick failover (transcript rebuilt from the stored checkpoint).
 
     Args:
         ctx: Populated responses context.
@@ -4329,11 +4979,14 @@ async def _stream_continued_response(
 
     """
     acc = pool.acquire_by_key(sess_prev.account_key)
-    if not acc:
-        sse_state.turn_error = HTTPException(
-            409,
-            "previous response account is cooling down; retry",
-        )
+    if acc is None:
+        async for frame in _stream_migrated_response(
+            ctx,
+            sess_prev,
+            sse_state,
+            writer,
+        ):
+            yield frame
         return
     turned_ok = False
     forked: GrokSession | None = None
@@ -4590,19 +5243,29 @@ async def _persist_response_session_for_stream(
     turn_state = sse_state.turn_state
     prev_chain = ctx.sess_prev.user_chain if ctx.sess_prev else []
     full_user_chain = [*prev_chain, *ctx.users]
+    prev_transcript = ctx.sess_prev.transcript if ctx.sess_prev else []
+    base = _prior_transcript(prev_transcript, ctx.transcript)
+    transcript = _session_transcript(
+        base,
+        ctx.prompt,
+        turn_state.grok,
+        "".join(sse_state.accumulated),
+    )
     st = SessionState(
         account_key=turn_acc.key,
         grok=turn_state.grok,
         user_chain=full_user_chain,
+        transcript=transcript,
     )
+    curr_key = chain_key(full_user_chain, ctx.auth_header)
     async with SESSION_LOCK:
         SESSIONS[ctx.rid] = st  # previous_response_id -> session
         SESSIONS[ctx.rid + ":chain"] = st
-        SESSIONS[chain_key(ctx.users, ctx.auth_header)] = st
+        SESSIONS[curr_key] = st
     for session_key in (
         ctx.rid,
         ctx.rid + ":chain",
-        chain_key(ctx.users, ctx.auth_header),
+        curr_key,
     ):
         store.save_session(
             session_key=session_key,
@@ -4612,6 +5275,7 @@ async def _persist_response_session_for_stream(
             last_parent_response_id=turn_state.grok.last_parent_response_id,
             model_mode=ctx.mode,
             attachments=_session_attachments(turn_state.grok),
+            transcript=transcript,
             created_at=st.created_at,
             last_used=st.last_used,
         )

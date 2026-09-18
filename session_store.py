@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_parent_response_id TEXT NOT NULL DEFAULT '',
     model_mode              TEXT NOT NULL DEFAULT 'fast',
     attachments_json        TEXT NOT NULL DEFAULT '[]',
+    transcript_json         TEXT NOT NULL DEFAULT '[]',
     created_at              REAL NOT NULL,
     last_used               REAL NOT NULL
 );
@@ -72,6 +73,7 @@ _SAVE_OPTION_NAMES = frozenset(
         "created_at",
         "last_used",
         "attachments",
+        "transcript",
     },
 )
 
@@ -111,6 +113,23 @@ def _coerce_user_chain(value: object) -> list[str]:
     return [item for item in items if isinstance(item, str)]
 
 
+def _coerce_transcript(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        content = entry.get("content")
+        if not isinstance(role, str) or role not in {"user", "assistant", "system"}:
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        out.append({"role": role, "content": content})
+    return out
+
+
 @dataclass(frozen=True)
 class _SessionValues:
     session_key: str
@@ -121,6 +140,7 @@ class _SessionValues:
     model_mode: str
     created_at: float
     last_used: float
+    transcript_json: str
 
 
 def _coerce_session_values(
@@ -133,6 +153,7 @@ def _coerce_session_values(
     coerced_key = "" if session_key is None else str(session_key)
     coerced_account = "" if account_key is None else str(account_key)
     clean_chain = _coerce_user_chain(user_chain)
+    clean_transcript = _coerce_transcript(options.get("transcript"))
     return _SessionValues(
         session_key=coerced_key,
         account_key=coerced_account,
@@ -144,9 +165,10 @@ def _coerce_session_values(
             options.get("last_parent_response_id", ""),
             "",
         ),
-        model_mode=_coerce_optional_text(options.get("model_mode", ""), "fast"),
+        model_mode=_coerce_optional_text(options.get("model_mode"), "fast"),
         created_at=_coerce_timestamp(options.get("created_at"), now),
         last_used=_coerce_timestamp(options.get("last_used"), now),
+        transcript_json=json.dumps(clean_transcript, ensure_ascii=False),
     )
 
 
@@ -179,6 +201,34 @@ def clean_attachment_rows(raw: object) -> list[dict[str, str | None]]:
     return out[-MAX_TRACKED_ATTACHMENTS:]
 
 
+def _decode_session_transcript(
+    raw_json: object,
+    session_key: str,
+) -> list[dict[str, str]]:
+    """Decode the stored per-turn transcript to role/content rows.
+
+    Args:
+        raw_json: Raw transcript_json column value.
+        session_key: Session key for corrupt-row debug logging.
+
+    Returns:
+        Valid transcript rows, oldest first.
+
+    """
+    if not isinstance(raw_json, str) or not raw_json:
+        return []
+    try:
+        raw: object = json.loads(raw_json)
+    except (ValueError, TypeError, AttributeError) as err:
+        logging.getLogger("uvicorn.error").debug(
+            "dropping corrupt transcript for session %s: %s",
+            session_key,
+            err,
+        )
+        return []
+    return _coerce_transcript(raw)
+
+
 class SqliteStore:
     """Persist sessions, account states, user ids, and Statsig pairs.
 
@@ -207,15 +257,21 @@ class SqliteStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
         conn.commit()
-        # Databases created before attachments_json existed: add the column
-        # in place; existing rows fall back to the '[]' default. Probe the
-        # schema instead of blanket-catching OperationalError, so a locked or
-        # otherwise broken database surfaces here instead of failing later
-        # with a misleading "no such column".
+        # Databases created before attachments_json / transcript_json existed:
+        # add the columns in place; existing rows fall back to the '[]'
+        # default. Probe the schema instead of blanket-catching
+        # OperationalError, so a locked or otherwise broken database surfaces
+        # here instead of failing later with a misleading "no such column".
         cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
         if "attachments_json" not in cols:
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN attachments_json"
+                " TEXT NOT NULL DEFAULT '[]'",
+            )
+            conn.commit()
+        if "transcript_json" not in cols:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN transcript_json"
                 " TEXT NOT NULL DEFAULT '[]'",
             )
             conn.commit()
@@ -334,6 +390,10 @@ class SqliteStore:
                 )
                 raw = []
         d["attachments"] = clean_attachment_rows(raw)
+        d["transcript"] = _decode_session_transcript(
+            d.get("transcript_json"),
+            session_key,
+        )
         return d
 
     def save_session(
@@ -351,7 +411,7 @@ class SqliteStore:
             user_chain: Ordered user message chain.
             **options: Optional row overrides (conversation_id,
                 last_parent_response_id, model_mode, created_at,
-                last_used, attachments).
+                last_used, attachments, transcript).
 
         Raises:
             TypeError: If an unknown option keyword is passed.
@@ -370,18 +430,19 @@ class SqliteStore:
             now,
         )
         raw_attachments = options.get("attachments")
-        if raw_attachments is None:
-            # Preserve the stored registry atomically: the scalar subquery
-            # reads the existing row's attachments_json inside the same
-            # INSERT, so a concurrent explicit-attachments save can never be
-            # clobbered by a stale read-modify-write.
+        if options.get("transcript") is None and raw_attachments is None:
+            # Preserve both side channels atomically: the scalar subqueries
+            # read the existing row inside the same INSERT, so a concurrent
+            # explicit save can never be clobbered by a stale read-modify-write.
             self._execute(
                 "INSERT OR REPLACE INTO sessions "
                 "(session_key, account_key, user_chain_json, conversation_id, "
                 "last_parent_response_id, model_mode, attachments_json, "
-                "created_at, last_used) "
+                "transcript_json, created_at, last_used) "
                 "VALUES (?, ?, ?, ?, ?, ?, "
                 "COALESCE((SELECT attachments_json FROM sessions "
+                "WHERE session_key = ?), '[]'), "
+                "COALESCE((SELECT transcript_json FROM sessions "
                 "WHERE session_key = ?), '[]'), ?, ?)",
                 (
                     values.session_key,
@@ -391,6 +452,30 @@ class SqliteStore:
                     values.last_parent_response_id,
                     values.model_mode,
                     values.session_key,
+                    values.session_key,
+                    values.created_at,
+                    values.last_used,
+                ),
+            )
+            return
+        if raw_attachments is None:
+            self._execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(session_key, account_key, user_chain_json, conversation_id, "
+                "last_parent_response_id, model_mode, attachments_json, "
+                "transcript_json, created_at, last_used) "
+                "VALUES (?, ?, ?, ?, ?, ?, "
+                "COALESCE((SELECT attachments_json FROM sessions "
+                "WHERE session_key = ?), '[]'), ?, ?, ?)",
+                (
+                    values.session_key,
+                    values.account_key,
+                    values.user_chain_json,
+                    values.conversation_id,
+                    values.last_parent_response_id,
+                    values.model_mode,
+                    values.session_key,
+                    values.transcript_json,
                     values.created_at,
                     values.last_used,
                 ),
@@ -400,12 +485,35 @@ class SqliteStore:
             clean_attachment_rows(raw_attachments),
             ensure_ascii=False,
         )
+        if options.get("transcript") is None:
+            self._execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(session_key, account_key, user_chain_json, conversation_id, "
+                "last_parent_response_id, model_mode, attachments_json, "
+                "transcript_json, created_at, last_used) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, "
+                "COALESCE((SELECT transcript_json FROM sessions "
+                "WHERE session_key = ?), '[]'), ?, ?)",
+                (
+                    values.session_key,
+                    values.account_key,
+                    values.user_chain_json,
+                    values.conversation_id,
+                    values.last_parent_response_id,
+                    values.model_mode,
+                    attachments_json,
+                    values.session_key,
+                    values.created_at,
+                    values.last_used,
+                ),
+            )
+            return
         self._execute(
             "INSERT OR REPLACE INTO sessions "
             "(session_key, account_key, user_chain_json, conversation_id, "
             "last_parent_response_id, model_mode, attachments_json, "
-            "created_at, last_used) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "transcript_json, created_at, last_used) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 values.session_key,
                 values.account_key,
@@ -414,6 +522,7 @@ class SqliteStore:
                 values.last_parent_response_id,
                 values.model_mode,
                 attachments_json,
+                values.transcript_json,
                 values.created_at,
                 values.last_used,
             ),
@@ -503,6 +612,11 @@ class SqliteStore:
                     )
                     d["user_chain"] = []
             key = d.get("session_key")
+            key_text = key if isinstance(key, str) else ""
+            d["transcript"] = _decode_session_transcript(
+                d.get("transcript_json"),
+                key_text,
+            )
             if isinstance(key, str):
                 out[key] = d
         return out

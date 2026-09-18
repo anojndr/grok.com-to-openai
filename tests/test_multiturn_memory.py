@@ -16,6 +16,12 @@ accounts never persist chats or leak memory across users), and fresh
 sessions resend the role-labeled transcript while continuations keep
 sending only the newest message (user_text stays the newest message for
 degraded-query detection).
+
+Stickiness: a live conversation pins the account that owns its gateway
+conversation (cookies, conversation id, file ids). Failover therefore
+rebuilds history plus the newest message from the stored transcript on a
+healthy account instead of round-robining mid-conversation; chained
+responses migrate the same way when the pinned account cools down.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from fastapi import Request
 
 import server
 from accounts import Account, AccountPool
-from grok_gateway import GrokSession, TurnResult, default_x_grok
+from grok_gateway import GatewayError, GrokSession, TurnResult, default_x_grok
 from session_store import SqliteStore
 
 if TYPE_CHECKING:
@@ -150,6 +156,31 @@ class HistoryPromptTests(unittest.TestCase):
             pytest.fail("transcript lost 974")
 
 
+class TranscriptHelperTests(unittest.TestCase):
+    """Verify transcript content rules through prompt rendering."""
+
+    @staticmethod
+    def test_rendered_prompt_marks_roles() -> None:
+        """Verify rendered failover prompts label user and assistant rows."""
+        rendered = server.render_transcript_prompt_for_tests([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ])
+        if rendered is None or "User: hi" not in rendered:
+            pytest.fail(f"user row missing from prompt: {rendered!r}")
+        if "Assistant: hello" not in rendered:
+            pytest.fail(f"assistant row missing from prompt: {rendered!r}")
+
+    @staticmethod
+    def test_single_row_renders_no_prompt() -> None:
+        """Verify a lone row is not enough for a failover transcript."""
+        rendered = server.render_transcript_prompt_for_tests([
+            {"role": "user", "content": "hi"},
+        ])
+        if rendered is not None:
+            pytest.fail(f"single row should not render: {rendered!r}")
+
+
 class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
     """Verify multi-turn memory across continuations and failover."""
 
@@ -255,6 +286,270 @@ class ChatMemoryTests(unittest.IsolatedAsyncioTestCase):
             pytest.fail("failover lost follow-up")
         if user_text2 != u2:
             pytest.fail("failover user_text mismatch")
+
+    async def test_sticky_turn_stays_on_pinned_account(self) -> None:
+        """A live conversation must not round-robin mid-chain."""
+        pool = AccountPool(self.tmp_dir / "accounts.txt", store=self.store)
+        acc_a = Account(
+            index=1,
+            cookies={"sso": "tok-a", "x-userid": "uid-A"},
+            user_id="uid-A",
+        )
+        acc_b = Account(
+            index=2,
+            cookies={"sso": "tok-b", "x-userid": "uid-B"},
+            user_id="uid-B",
+        )
+        pool.replace_accounts([acc_a, acc_b])
+        server.pool = pool
+        u1 = "remember the number 974"
+        u2 = "what number did i ask you to remember again?"
+        seen_cookies: list[str] = []
+
+        async def fake_run(
+            sess: GrokSession,
+            prompt: str,
+            **kwargs: object,
+        ) -> tuple[TurnResult, list[dict[str, object]]]:
+            await asyncio.sleep(0)
+            seen_cookies.append(sess.cookie_header)
+            self.seen.append(
+                (prompt, kwargs.get("user_text"), sess.last_parent_response_id),
+            )
+            response_id = f"response-{len(self.seen)}"
+            sess.conversation_id = sess.conversation_id or "conv-sticky"
+            sess.last_parent_response_id = response_id
+            return TurnResult(text=response_id, response_id=response_id), []
+
+        with (
+            patch.object(server, "run_session_turn", new=fake_run),
+            patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+        ):
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("first turn status mismatch")
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1, u2])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("second turn status mismatch")
+        if len(seen_cookies) != EXPECTED_TURNS:
+            pytest.fail("expected two turns")
+        if seen_cookies[0] != seen_cookies[1]:
+            pytest.fail("sticky turn left its account")
+        prompt2, _, _ = self.seen[1]
+        if prompt2 != u2:
+            pytest.fail("sticky continuation must send newest only")
+
+    async def test_failed_pinned_turn_migrates_with_transcript(self) -> None:
+        """Pinned-account failure migrates with history, not a bare prompt."""
+        pool = AccountPool(self.tmp_dir / "accounts.txt", store=self.store)
+        acc_a = Account(
+            index=1,
+            cookies={"sso": "tok-a", "x-userid": "uid-A"},
+            user_id="uid-A",
+        )
+        acc_b = Account(
+            index=2,
+            cookies={"sso": "tok-b", "x-userid": "uid-B"},
+            user_id="uid-B",
+        )
+        pool.replace_accounts([acc_a, acc_b])
+        server.pool = pool
+        u1 = "remember the number 974"
+        u2 = "what number did i ask you to remember again?"
+        calls: list[tuple[str, str]] = []
+
+        async def fake_run(
+            sess: GrokSession,
+            prompt: str,
+            **_kwargs: object,
+        ) -> tuple[TurnResult, list[dict[str, object]]]:
+            await asyncio.sleep(0)
+            calls.append((sess.cookie_header, prompt))
+            if "tok-a" in sess.cookie_header:
+                kind = "upstream"
+                msg = "boom"
+                raise GatewayError(kind, msg)
+            sess.conversation_id = sess.conversation_id or "conv-migrated"
+            sess.last_parent_response_id = "response-migrated"
+            return TurnResult(text="migrated-ok", response_id="response-migrated"), []
+
+        with (
+            patch.object(server, "run_session_turn", new=fake_run),
+            patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+        ):
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("first turn status mismatch")
+            # Force turn 2 back onto the pinned (A) conversation even though
+            # round-robin would hand out B: failover must migrate to B.
+            async with server.SESSION_LOCK:
+                for st in server.SESSIONS.values():
+                    st.account_key = acc_a.key
+            server.SESSIONS[server.chain_key([u1])].grok.conversation_id = "conv-a"
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1, u2])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("migrated turn status mismatch")
+        if len(calls) != EXPECTED_TURNS + 1:
+            pytest.fail(f"expected pinned failure plus migration: {calls!r}")
+        migrated_prompt = calls[-1][1]
+        if "974" not in migrated_prompt:
+            pytest.fail("migration lost 974")
+        if u2 not in migrated_prompt:
+            pytest.fail("migration lost follow-up")
+        if "tok-b" not in calls[-1][0]:
+            pytest.fail("migration stayed on the failed account")
+
+    async def test_failed_pinned_turn_keeps_request_only_tail(self) -> None:
+        """Migration must not drop a request tail missing from storage."""
+        pool = AccountPool(self.tmp_dir / "accounts.txt", store=self.store)
+        acc_a = Account(
+            index=1,
+            cookies={"sso": "tok-a", "x-userid": "uid-A"},
+            user_id="uid-A",
+        )
+        acc_b = Account(
+            index=2,
+            cookies={"sso": "tok-b", "x-userid": "uid-B"},
+            user_id="uid-B",
+        )
+        pool.replace_accounts([acc_a, acc_b])
+        server.pool = pool
+        u1 = "remember the number 974"
+        u2 = "middle question only this client sent"
+        u3 = "what number did i ask you to remember again?"
+        calls: list[tuple[str, str]] = []
+
+        async def fake_run(
+            sess: GrokSession,
+            prompt: str,
+            **_kwargs: object,
+        ) -> tuple[TurnResult, list[dict[str, object]]]:
+            await asyncio.sleep(0)
+            calls.append((sess.cookie_header, prompt))
+            if "tok-a" in sess.cookie_header and len(calls) > 1:
+                kind = "upstream"
+                msg = "boom"
+                raise GatewayError(kind, msg)
+            sess.conversation_id = sess.conversation_id or "conv-mixed"
+            sess.last_parent_response_id = f"response-{len(calls)}"
+            return TurnResult(
+                text=f"response-{len(calls)}",
+                response_id=f"response-{len(calls)}",
+            ), []
+
+        with (
+            patch.object(server, "run_session_turn", new=fake_run),
+            patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+        ):
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("first turn status mismatch")
+            # Stored history only knows u1; the request chain carries an
+            # extra middle turn. Migration must keep both, not just storage.
+            async with server.SESSION_LOCK:
+                for st in server.SESSIONS.values():
+                    st.account_key = acc_a.key
+            server.SESSIONS[server.chain_key([u1])].grok.conversation_id = "conv-a"
+            resp = await server.chat_completions(
+                FakeRequest(self._msgs([u1, u2, u3])),
+            )
+            if resp.status_code != HTTP_OK:
+                pytest.fail("migrated turn status mismatch")
+        migrated_prompt = calls[-1][1]
+        if u1 not in migrated_prompt:
+            pytest.fail("migration lost stored history")
+        if u2 not in migrated_prompt:
+            pytest.fail("migration lost request-only tail")
+        if u3 not in migrated_prompt:
+            pytest.fail("migration lost follow-up")
+
+    async def test_chat_persist_merges_fork_history(self) -> None:
+        """Persist must keep checkpoint assistant history, not just request."""
+        self._pool_with("uid-1")
+        u1 = "remember the number 974"
+        u2 = "what number did i ask you to remember again?"
+        with (
+            patch.object(server, "run_session_turn", new=self._fake_run()),
+            patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+        ):
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("first turn status mismatch")
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1, u2])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("second turn status mismatch")
+        saved = self.store.get_session(server.chain_key([u1, u2]))
+        if saved is None:
+            pytest.fail("checkpoint missing after persist")
+        transcript = saved.get("transcript")
+        if not isinstance(transcript, list):
+            pytest.fail(f"checkpoint has no transcript: {transcript!r}")
+        texts: list[str] = [
+            str(row.get("content"))
+            for row in transcript
+            if isinstance(row, dict) and isinstance(row.get("content"), str)
+        ]
+        if not any("response-1" in text for text in texts):
+            pytest.fail(f"fork assistant history lost: {transcript!r}")
+        if not any(u2 in text for text in texts):
+            pytest.fail(f"follow-up lost from transcript: {transcript!r}")
+
+    async def test_cooling_chat_checkpoint_migrates_with_history(self) -> None:
+        """A cooling pinned chat checkpoint must migrate, not bare-prompt."""
+        pool = AccountPool(self.tmp_dir / "accounts.txt", store=self.store)
+        acc_a = Account(
+            index=1,
+            cookies={"sso": "tok-a", "x-userid": "uid-A"},
+            user_id="uid-A",
+        )
+        acc_b = Account(
+            index=2,
+            cookies={"sso": "tok-b", "x-userid": "uid-B"},
+            user_id="uid-B",
+        )
+        pool.replace_accounts([acc_a, acc_b])
+        server.pool = pool
+        u1 = "remember the number 974"
+        u2 = "what number did i ask you to remember again?"
+        calls: list[tuple[str, str]] = []
+
+        async def fake_run(
+            sess: GrokSession,
+            prompt: str,
+            **_kwargs: object,
+        ) -> tuple[TurnResult, list[dict[str, object]]]:
+            await asyncio.sleep(0)
+            calls.append((sess.cookie_header, prompt))
+            sess.conversation_id = sess.conversation_id or "conv-cool"
+            sess.last_parent_response_id = f"response-{len(calls)}"
+            return TurnResult(
+                text=f"response-{len(calls)}",
+                response_id=f"response-{len(calls)}",
+            ), []
+
+        with (
+            patch.object(server, "run_session_turn", new=fake_run),
+            patch.object(server, "refresh_statsig_pair", new=AsyncMock()),
+        ):
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("first turn status mismatch")
+            # Evict memory and cool the pinned account: turn 2 must rebuild
+            # from the stored transcript on the healthy account.
+            server.SESSIONS.clear()
+            acc_a.cooldown_until = 9999999999.0
+            resp = await server.chat_completions(FakeRequest(self._msgs([u1, u2])))
+            if resp.status_code != HTTP_OK:
+                pytest.fail("migrated turn status mismatch")
+        if len(calls) != EXPECTED_TURNS:
+            pytest.fail(f"expected root plus migration: {calls!r}")
+        migrated_prompt = calls[-1][1]
+        if "974" not in migrated_prompt:
+            pytest.fail("cooling migration lost 974")
+        if u2 not in migrated_prompt:
+            pytest.fail("cooling migration lost follow-up")
+        if "tok-b" not in calls[-1][0]:
+            pytest.fail("cooling migration stayed on the cooled account")
 
 
 class StreamUserTextTests(unittest.IsolatedAsyncioTestCase):

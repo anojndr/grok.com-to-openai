@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING, Any, override
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 import server
 from accounts import Account, AccountPool
-from grok_gateway import TurnResult
+from grok_gateway import GatewayError, TurnResult
 from session_store import SqliteStore
 from statsig import StatsigGenerator
 
@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from grok_gateway import GrokSession
 
 _HTTP_OK = 200
+_BAD_REQUEST = 400
+_EXPECTED_MIGRATION_TURNS = 2
 _COOLDOWN_UNTIL = 100.0
 _DEGRADED_UNTIL = 200.0
 _TOTAL_REQUESTS = 10
@@ -541,6 +543,160 @@ class SqlitePersistenceTests(unittest.IsolatedAsyncioTestCase):
         chain = saved.get("user_chain")
         if chain != ["what sections to avoid", "what sections to avoid"]:
             pytest.fail(f"repeated tail dropped from chain: {chain!r}")
+
+    async def test_chained_response_migrates_when_pinned_account_cools(self) -> None:
+        """Verify a cooled-down pinned account migrates with the transcript."""
+        acc_a = Account(
+            index=1,
+            cookies={"sso": "tok-a", "x-userid": "uid-A"},
+            user_id="uid-A",
+        )
+        acc_b = Account(
+            index=2,
+            cookies={"sso": "tok-b", "x-userid": "uid-B"},
+            user_id="uid-B",
+        )
+        pool = AccountPool(Path(self.tmp_dir) / "accounts.txt", store=self.store)
+        pool.replace_accounts([acc_a, acc_b])
+        server.pool = pool
+        server.SESSIONS.clear()
+        prompts: list[str] = []
+
+        async def fake_run_turn(
+            sess: GrokSession,
+            prompt: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[TurnResult, list[dict[str, Any]]]:
+            """Replay canned turns while recording migrated prompts.
+
+            Returns:
+                The canned turn result with no follow-up events.
+
+            """
+            await asyncio.sleep(0)
+            prompts.append(prompt)
+            sess.conversation_id = sess.conversation_id or "conv-migrate"
+            sess.last_parent_response_id = f"msg-{len(prompts)}"
+            return TurnResult(
+                text=f"answer-{len(prompts)}",
+                response_id=f"msg-{len(prompts)}",
+                conversation_id=sess.conversation_id,
+                parent_response_id="",
+                finish_reason="stop",
+            ), []
+
+        with (
+            patch("server.run_session_turn", new=fake_run_turn),
+            patch("server.refresh_statsig_pair", new=AsyncMock()),
+        ):
+            first = await server.responses_api(
+                FakeRequest({"input": "capital of France"}),
+            )
+            if first.status_code != _HTTP_OK:
+                pytest.fail("root turn failed")
+            first_id = json.loads(bytes(first.body))["id"]
+            # Cool down the pinned account: the chained follow-up must migrate
+            # to the healthy account with history, not fail with a 409.
+            acc_a.cooldown_until = 9999999999.0
+            second = await server.responses_api(
+                FakeRequest({
+                    "input": "and its population?",
+                    "previous_response_id": first_id,
+                }),
+            )
+            if second.status_code != _HTTP_OK:
+                pytest.fail(f"migrated chained turn failed: {second.status_code}")
+            second_id = json.loads(bytes(second.body))["id"]
+
+        if len(prompts) != _EXPECTED_MIGRATION_TURNS:
+            pytest.fail(f"expected root plus migration: {prompts!r}")
+        if "capital of France" not in prompts[1]:
+            pytest.fail(f"migration lost history: {prompts[1]!r}")
+        if "and its population?" not in prompts[1]:
+            pytest.fail(f"migration lost follow-up: {prompts[1]!r}")
+        saved = self.store.get_session(second_id)
+        if saved is None:
+            pytest.fail("migrated turn not persisted")
+        if saved.get("account_key") == acc_a.key:
+            pytest.fail("migrated turn stayed on the cooled-down account")
+        chain = saved.get("user_chain")
+        if chain != ["capital of France", "and its population?"]:
+            pytest.fail(f"migrated chain wrong: {chain!r}")
+
+    async def test_unknown_previous_response_id_rejects_with_400(self) -> None:
+        """Verify an unknown chained id fails loudly instead of fresh-starting."""
+        fake_acc = Account(
+            index=1,
+            cookies={"sso": "tok", "x-userid": "uid-1"},
+            user_id="uid-1",
+        )
+        self._install_pool(fake_acc)
+        server.SESSIONS.clear()
+        with (
+            patch("server.refresh_statsig_pair", new=AsyncMock()),
+            pytest.raises(HTTPException) as ctx,
+        ):
+            await server.responses_api(
+                FakeRequest({
+                    "input": "follow up",
+                    "previous_response_id": "resp_missing",
+                }),
+            )
+        if ctx.value.status_code != _BAD_REQUEST:
+            pytest.fail(f"unknown id should be a 400, got {ctx.value.status_code}")
+
+    def test_attachments_only_save_preserves_transcript(self) -> None:
+        """Verify an attachments-only resave keeps the stored transcript."""
+        transcript = [
+            {"role": "user", "content": "remember 974"},
+            {"role": "assistant", "content": "got it"},
+        ]
+        self.store.save_session(
+            "k",
+            "acc",
+            ["remember 974"],
+            attachments=[{"file_id": "fid1", "hash": None}],
+            transcript=transcript,
+        )
+        self.store.save_session(
+            "k",
+            "acc",
+            ["remember 974"],
+            attachments=[{"file_id": "fid2", "hash": None}],
+        )
+        saved = self.store.get_session("k")
+        if saved is None:
+            pytest.fail("session missing after resave")
+        if saved.get("transcript") != transcript:
+            pytest.fail(
+                f"transcript wiped on attachments save: {saved.get('transcript')!r}",
+            )
+
+    async def test_uid_resolve_failure_still_restores_checkpoint(self) -> None:
+        """Verify restore survives an unresolvable pinned-account uid."""
+        fake_acc = Account(
+            index=1,
+            cookies={"sso": "tok", "x-userid": ""},
+            user_id="",
+        )
+        self._install_pool(fake_acc)
+        server.SESSIONS.clear()
+        self.store.save_session(
+            "resp_prev",
+            fake_acc.key,
+            ["remember 974"],
+            transcript=[{"role": "user", "content": "remember 974"}],
+        )
+        with patch(
+            "server.gw.resolve_user_id",
+            new=AsyncMock(side_effect=GatewayError("auth", "auth down")),
+        ):
+            restored = await server.restore_prev_session_for_tests("resp_prev")
+        if restored is None:
+            pytest.fail("restore should survive uid failure")
+        if restored.transcript != [{"role": "user", "content": "remember 974"}]:
+            pytest.fail(f"restore lost transcript: {restored.transcript!r}")
 
 
 if __name__ == "__main__":
