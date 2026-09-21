@@ -32,6 +32,12 @@ ACCOUNTS_FILE = os.getenv("G2O_ACCOUNTS_FILE", str(BASE_DIR / "accounts.txt"))
 # SQLite database path for persistent sessions, accounts and caches
 DB_PATH = os.getenv("G2O_DB_PATH", str(BASE_DIR / "data" / "grok_store.db"))
 
+# Redis cache URL for the SQLite mirror (localhost only by default).
+# Empty disables Redis; SQLite stays the source of truth either way.
+REDIS_URL = os.getenv("G2O_REDIS_URL", "redis://127.0.0.1:6379/0")
+# Master switch for the Redis mirror (1/true/yes/on enables).
+REDIS_ENABLED = os.getenv("G2O_REDIS_ENABLED", "1").strip().lower() in _TRUTHY_VALUES
+
 # Optional API key to protect THIS server
 # (clients must send `Authorization: Bearer <key>`).
 API_KEY = os.getenv("G2O_API_KEY", "")

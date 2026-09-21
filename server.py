@@ -50,6 +50,7 @@ from config import (
     USER_AGENT,
 )
 from grok_gateway import GatewayError, GrokSession, RenderFilter, TurnResult
+from redis_store import HybridStore
 from session_store import MAX_TRACKED_ATTACHMENTS, SqliteStore, clean_attachment_rows
 from statsig import StatsigGenerator
 from uploads import (
@@ -67,7 +68,12 @@ if TYPE_CHECKING:
 
 app = FastAPI(title="grok-to-openai-api", version="1.0")
 
-store = SqliteStore(config.DB_PATH)
+store: SqliteStore = HybridStore(
+    config.DB_PATH,
+    redis_url=config.REDIS_URL,
+    redis_enabled=config.REDIS_ENABLED,
+    session_ttl=SESSION_TTL,
+)
 pool = AccountPool(config.ACCOUNTS_FILE, cooldown_seconds=COOLDOWN_SECONDS, store=store)
 statsig = StatsigGenerator(store=store)
 
@@ -5435,7 +5441,7 @@ async def models(request: Request) -> dict[str, Any]:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    """Report service, account, and session health.
+    """Report service, account, session, and cache health.
 
     Returns:
         Health payload.
@@ -5443,7 +5449,7 @@ async def healthz() -> dict[str, Any]:
     """
     await pool.reload_if_changed()
     accounts = pool.snapshot()
-    return {
+    payload: dict[str, Any] = {
         "ok": True,
         "accounts": len(accounts),
         "available": sum(1 for a in accounts if a.available()),
@@ -5451,6 +5457,10 @@ async def healthz() -> dict[str, Any]:
         "sessions": len(SESSIONS),
         "degraded_accounts": sum(1 for a in accounts if time.time() < a.degraded_until),
     }
+    status = store.redis_status() if isinstance(store, HybridStore) else None
+    if status is not None:
+        payload["redis"] = status
+    return payload
 
 
 if __name__ == "__main__":

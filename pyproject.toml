@@ -10,6 +10,7 @@ dependencies = [
   "uvicorn>=0.29",
   "websockets>=12",
   "pydantic>=2",
+  "redis>=8.1.0",
 ]
 
 [dependency-groups]
@@ -36,7 +37,7 @@ unfixable = []
 max-line-length = 88
 
 [tool.ruff.lint.isort]
-known-first-party = ["accounts", "config", "grok_gateway", "server", "session_store", "statsig", "uploads"]
+known-first-party = ["accounts", "config", "grok_gateway", "redis_store", "server", "session_store", "statsig", "uploads"]
 
 [tool.ty.rules]
 all = "error"
