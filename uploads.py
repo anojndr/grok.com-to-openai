@@ -248,6 +248,9 @@ async def _poll_upload_status(
     Returns:
         The file metadata, or None when processing stalls.
 
+    Raises:
+        UploadError: If the gateway reports an error status.
+
     """
     for _ in range(20):
         status_headers = {
@@ -262,12 +265,18 @@ async def _poll_upload_status(
         )
         if response.status_code == _HTTP_OK:
             body = _as_string_map(response.json())
+            status = body.get("status")
+            if isinstance(status, str) and status.upper() == "ERROR":
+                raw_err = body.get("errorMessage")
+                msg = (
+                    raw_err
+                    if isinstance(raw_err, str) and raw_err
+                    else "file processing failed"
+                )
+                raise UploadError(msg)
             file_meta = _as_string_map(body.get("fileMetadata"))
             if file_meta.get("fileMetadataId"):
                 return file_meta
-            status = body.get("status")
-            if isinstance(status, str) and status.upper() == "ERROR":
-                break
         await asyncio.sleep(0.5)
     return None
 
